@@ -277,8 +277,8 @@ def apply_window_specific_styles(window):
     if footer_frame is not None:
         footer_frame.setStyleSheet("""
             #footerFrame {
-                background-color: #313131;
-                border-top: 3px solid #8b0000;
+                background-color: #8dc8e8;
+                border-top: 3px solid #adadad;
             }
         """)
 

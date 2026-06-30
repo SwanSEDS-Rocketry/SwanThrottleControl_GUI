@@ -405,7 +405,7 @@ class Ui_MainWindow(object):
         self.label_8.setText(QCoreApplication.translate("MainWindow", u"Status:", None))
         self.calibrationLabel.setText(QCoreApplication.translate("MainWindow", u"TextLabel", None))
         self.label_9.setText(QCoreApplication.translate("MainWindow", u"Kilgharrah Throttle Control Software", None))
-        self.label_10.setText(QCoreApplication.translate("MainWindow", u"Version 0.1", None))
+        self.label_10.setText(QCoreApplication.translate("MainWindow", u"Version 0.1.1", None))
         self.menuFile.setTitle(QCoreApplication.translate("MainWindow", u"File", None))
         self.menuEdit.setTitle(QCoreApplication.translate("MainWindow", u"Edit", None))
         self.menuView.setTitle(QCoreApplication.translate("MainWindow", u"View", None))
