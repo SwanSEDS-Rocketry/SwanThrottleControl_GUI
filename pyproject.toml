@@ -1,0 +1,5 @@
+[project]
+name = "SwanThrottleGUI"
+
+[tool.pyside6-project]
+files = ["about.ui", "main.py", "main.ui"]
