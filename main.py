@@ -27,13 +27,13 @@ def load_ui_file(file_name, parent=None):
 
 def load_main_window():
     window = load_ui_file("main.ui")
-    window.setWindowTitle("Swan Throttle Control")
+    window.setWindowTitle("SwanSEDS | Kilgharrah Throttle Control Software v0.1.1")
     return window
 
 
 def load_about_window(parent=None):
     about_window = load_ui_file("about.ui", parent)
-    about_window.setWindowTitle("About Swan Throttle Control")
+    about_window.setWindowTitle("About")
 
     close_button = about_window.findChild(QPushButton, "closeButton")
     if close_button is not None:
