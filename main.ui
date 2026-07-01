@@ -386,7 +386,7 @@
     <property name="title">
      <string>Calibration</string>
     </property>
-    <widget class="QPushButton" name="pushButton_2">
+    <widget class="QPushButton" name="calibrateButton">
      <property name="geometry">
       <rect>
        <x>10</x>
@@ -463,7 +463,7 @@
         </font>
        </property>
        <property name="text">
-        <string>Version 0.1.3</string>
+        <string>Version 0.1.4</string>
        </property>
        <property name="alignment">
         <set>Qt::AlignmentFlag::AlignCenter</set>
