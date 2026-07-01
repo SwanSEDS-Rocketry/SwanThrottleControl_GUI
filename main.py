@@ -1,10 +1,18 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QIODevice
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QFile, QIODevice, QObject, Signal
+from PySide6.QtGui import QAction, QTextCursor
 from PySide6.QtUiTools import QUiLoader
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QDialog,
+    QTextEdit,
+    QVBoxLayout,
+)
 
 from arduino_connection import ArduinoConnection
 
@@ -32,6 +40,10 @@ def load_ui_file(file_name, parent=None):
 def load_main_window():
     window = load_ui_file("main.ui")
     window.setWindowTitle(APP_TITLE)
+
+    # Lock the window to the size set in Qt Designer
+    window.setFixedSize(window.size())
+
     return window
 
 
@@ -111,10 +123,59 @@ def apply_light_theme(app):
     """)
 
 
+class TerminalWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Terminal")
+        self.resize(800, 450)
+
+        self.terminal_output = QTextEdit()
+        self.terminal_output.setReadOnly(True)
+
+        self.terminal_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #111111;
+                color: #eeeeee;
+                font-family: Consolas, Courier New, monospace;
+                font-size: 10pt;
+            }
+        """)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.terminal_output)
+        self.setLayout(layout)
+
+    def write_text(self, text):
+        self.terminal_output.moveCursor(QTextCursor.End)
+        self.terminal_output.insertPlainText(str(text))
+        self.terminal_output.moveCursor(QTextCursor.End)
+
+
+class OutputRedirector(QObject):
+    text_written = Signal(str)
+
+    def __init__(self, original_stream):
+        super().__init__()
+        self.original_stream = original_stream
+
+    def write(self, text):
+        self.original_stream.write(text)
+        self.original_stream.flush()
+
+        if text:
+            self.text_written.emit(str(text))
+
+    def flush(self):
+        self.original_stream.flush()
+
+
 class MenuActions:
     def __init__(self, window):
         self.window = window
         self.about_window = None
+        self.terminal_window = None
+        self.terminal_history = ""
 
         self.action_about = window.findChild(QAction, "actionAbout")
 
@@ -123,9 +184,48 @@ class MenuActions:
         else:
             print("Warning: Could not find actionAbout")
 
+        self.setup_terminal_menu_action()
+
+    def setup_terminal_menu_action(self):
+        menu_bar = self.window.menuBar()
+
+        if menu_bar is None:
+            print("Warning: Could not find menu bar")
+            return
+
+        view_menu = None
+
+        for action in menu_bar.actions():
+            if action.text().replace("&", "") == "View":
+                view_menu = action.menu()
+                break
+
+        if view_menu is None:
+            view_menu = menu_bar.addMenu("View")
+
+        self.action_terminal = QAction("Terminal", self.window)
+        self.action_terminal.triggered.connect(self.show_terminal_window)
+
+        view_menu.addAction(self.action_terminal)
+
     def show_about_window(self):
         self.about_window = load_about_window(self.window)
         self.about_window.show()
+
+    def show_terminal_window(self):
+        if self.terminal_window is None:
+            self.terminal_window = TerminalWindow(self.window)
+            self.terminal_window.write_text(self.terminal_history)
+
+        self.terminal_window.show()
+        self.terminal_window.raise_()
+        self.terminal_window.activateWindow()
+
+    def write_terminal_text(self, text):
+        self.terminal_history += str(text)
+
+        if self.terminal_window is not None:
+            self.terminal_window.write_text(text)
 
 
 def apply_window_specific_styles(window):
@@ -213,12 +313,24 @@ def main():
     window = load_main_window()
     apply_window_specific_styles(window)
 
-    arduino = ArduinoConnection(window)
     menu_actions = MenuActions(window)
+
+    stdout_redirector = OutputRedirector(sys.stdout)
+    stderr_redirector = OutputRedirector(sys.stderr)
+
+    stdout_redirector.text_written.connect(menu_actions.write_terminal_text)
+    stderr_redirector.text_written.connect(menu_actions.write_terminal_text)
+
+    sys.stdout = stdout_redirector
+    sys.stderr = stderr_redirector
+
+    arduino = ArduinoConnection(window)
 
     # Keep references alive so Qt does not garbage collect them.
     window.arduino_connection = arduino
     window.menu_actions = menu_actions
+    window.stdout_redirector = stdout_redirector
+    window.stderr_redirector = stderr_redirector
 
     window.show()
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pyqtgraph as pg
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QTimer, QElapsedTimer
 from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
@@ -38,6 +38,15 @@ class ArduinoConnection(QObject):
         self.select_sequence_button = window.findChild(QPushButton, "selectSequenceButton")
         self.sequence_name_label = window.findChild(QLabel, "sequenceName")
         self.selected_sequence_file = None
+
+        self.sequence_times_ms = []
+        self.sequence_duration_ms = 0
+
+        self.sequence_playhead_timer = QTimer(self)
+        self.sequence_playhead_timer.timeout.connect(self.update_sequence_playhead)
+
+        self.sequence_elapsed_timer = QElapsedTimer()
+        self.sequence_playhead_running = False
 
         self.upload_sequence_button = window.findChild(QPushButton, "uploadSeqButton")
 
@@ -84,7 +93,7 @@ class ArduinoConnection(QObject):
     def setup_defaults(self):
         self.ip_edit.setText("192.168.10.2")
         self.port_edit.setText("5000")
-        self.status_label.setText("Disconnected")
+        self.set_status("Disconnected")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         self.sequence_name_label.setText("No Sequence Loaded")
@@ -108,7 +117,7 @@ class ArduinoConnection(QObject):
         self.sequence_plot.showGrid(x=True, y=True)
 
         self.sequence_plot.setTitle("Throttle Sequence")
-        self.sequence_plot.setLabel("bottom", "Time")
+        self.sequence_plot.setLabel("bottom", "Time", units="ms")
         self.sequence_plot.setLabel("left", "Throttle", units="%")
 
         self.sequence_plot.setYRange(0, 100)
@@ -120,6 +129,16 @@ class ArduinoConnection(QObject):
             symbol="o",
             symbolSize=6,
         )
+
+        self.sequence_playhead_line = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(width=2),
+        )
+
+        self.sequence_plot.addItem(self.sequence_playhead_line)
+        self.sequence_playhead_line.setVisible(False)
 
         layout = QVBoxLayout(self.sequence_graph_frame)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -141,7 +160,7 @@ class ArduinoConnection(QObject):
                         time_ms = float(row[0])
                         throttle = float(row[1])
                     except ValueError:
-                        # Allows header row like: time_ms,throttle
+                        # Allows header row like: time_ms, throttle
                         continue
 
                     times_ms.append(time_ms)
@@ -152,6 +171,12 @@ class ArduinoConnection(QObject):
                 return
 
             self.sequence_curve.setData(times_ms, throttles_percent)
+
+            self.sequence_times_ms = times_ms
+            self.sequence_duration_ms = max(times_ms)
+
+            self.sequence_playhead_line.setValue(min(times_ms))
+            self.sequence_playhead_line.setVisible(True)
 
             self.sequence_plot.setYRange(0, 100)
 
@@ -164,6 +189,40 @@ class ArduinoConnection(QObject):
             self.set_status("Graph update failed")
             print(f"Graph update failed: {error}")
 
+    def start_sequence_playhead(self):
+        if self.sequence_duration_ms <= 0:
+            self.set_status("Cannot animate sequence: invalid duration")
+            return
+
+        self.sequence_playhead_line.setVisible(True)
+        self.sequence_playhead_line.setValue(0)
+
+        self.sequence_elapsed_timer.restart()
+        self.sequence_playhead_running = True
+
+        self.sequence_playhead_timer.start(50)
+
+        print("Sequence playhead started")
+
+    def update_sequence_playhead(self):
+        if not self.sequence_playhead_running:
+            return
+
+        elapsed_ms = self.sequence_elapsed_timer.elapsed()
+
+        self.sequence_playhead_line.setValue(elapsed_ms)
+
+        if elapsed_ms >= self.sequence_duration_ms:
+            self.sequence_playhead_line.setValue(self.sequence_duration_ms)
+            self.stop_sequence_playhead()
+            self.set_status("Sequence finished")
+
+    def stop_sequence_playhead(self):
+        self.sequence_playhead_timer.stop()
+        self.sequence_playhead_running = False
+
+        print("Sequence playhead stopped")
+
     def get_ip_and_port(self):
         ip = self.ip_edit.text().strip()
         port_text = self.port_edit.text().strip()
@@ -171,11 +230,11 @@ class ArduinoConnection(QObject):
         try:
             port = int(port_text)
         except ValueError:
-            self.status_label.setText("Invalid port")
+            self.set_status("Invalid port")
             return None, None
 
         if not 1 <= port <= 65535:
-            self.status_label.setText("Port must be 1-65535")
+            self.set_status("Port must be 1-65535")
             return None, None
 
         return ip, port
@@ -184,7 +243,7 @@ class ArduinoConnection(QObject):
         state = self.socket.state()
 
         if state == QAbstractSocket.ConnectedState:
-            self.status_label.setText("Disconnecting...")
+            self.set_status("Disconnecting...")
             self.socket.disconnectFromHost()
             return
 
@@ -192,8 +251,10 @@ class ArduinoConnection(QObject):
             QAbstractSocket.ConnectingState,
             QAbstractSocket.HostLookupState,
         ):
-            self.status_label.setText("Cancelling connection...")
+            self.set_status("Cancelling connection...")
             self.socket.abort()
+            self.connect_button.setText("Connect")
+            self.ping_button.setEnabled(False)
             return
 
         ip, port = self.get_ip_and_port()
@@ -201,39 +262,41 @@ class ArduinoConnection(QObject):
         if ip is None or port is None:
             return
 
-        self.status_label.setText(f"Connecting to {ip}:{port}...")
+        self.set_status(f"Connecting to {ip}:{port}...")
         self.connect_button.setText("Cancel")
+        self.ping_button.setEnabled(False)
 
         self.socket.abort()
         self.socket.connectToHost(ip, port)
 
     def ping_arduino(self):
         if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.status_label.setText("Not connected")
+            self.set_status("Not connected")
             print("Cannot ping: not connected")
             return
 
         self.socket.write(struct.pack("<H", 0xFFFF))
         self.socket.flush()
 
-        self.status_label.setText("Ping sent")
-        print("Ping sent")
+        self.set_status("Ping sent")
 
     def on_connected(self):
-        self.status_label.setText("Connected")
+        self.set_status("Connected")
         self.connect_button.setText("Disconnect")
         self.ping_button.setEnabled(True)
         print("Connected to Arduino")
 
     def on_disconnected(self):
-        self.status_label.setText("Disconnected")
+        self.stop_sequence_playhead()
+        self.set_status("Disconnected")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         print("Disconnected from Arduino")
 
     def on_error(self, socket_error):
         error_text = self.socket.errorString()
-        self.status_label.setText(f"Error: {error_text}")
+        self.stop_sequence_playhead()
+        self.set_status(f"Error: {error_text}")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         print(f"Socket error: {error_text}")
@@ -247,10 +310,10 @@ class ArduinoConnection(QObject):
         text = data.decode("utf-8", errors="replace").strip()
 
         if text == "PONG":
-            self.status_label.setText("Arduino replied: PONG")
+            self.set_status("Arduino replied: PONG")
             print("Arduino replied: PONG")
         else:
-            self.status_label.setText(f"Arduino: {text}")
+            self.set_status(f"Arduino: {text}")
             print(f"Arduino TCP data: {data}")
 
     def select_throttle_sequence(self):
@@ -262,7 +325,7 @@ class ArduinoConnection(QObject):
         )
 
         if not file_path:
-            self.status_label.setText("No sequence selected")
+            self.set_status("No sequence selected")
             return
 
         self.selected_sequence_file = file_path
@@ -270,7 +333,7 @@ class ArduinoConnection(QObject):
 
         self.sequence_name_label.setText(file_name)
 
-        self.status_label.setText("Throttle sequence selected")
+        self.set_status("Throttle sequence selected")
         print(f"Selected throttle sequence: {file_path}")
 
         self.update_sequence_graph(file_path)
@@ -280,11 +343,15 @@ class ArduinoConnection(QObject):
             self.set_status("No sequence selected")
             return
 
+        if self.socket.state() != QAbstractSocket.ConnectedState:
+            self.set_status("Not connected")
+            return
+
         project_dir = Path(__file__).parent
 
         selected_file = Path(self.selected_sequence_file)
         convert_script = project_dir / "convert_throttle.py"
-        send_script = project_dir / "send_sequence_tcp.py"
+        converted_file = project_dir / "converted_sequence.csv"
 
         if not selected_file.exists():
             self.set_status("Selected sequence file not found")
@@ -294,11 +361,6 @@ class ArduinoConnection(QObject):
         if not convert_script.exists():
             self.set_status("convert_throttle.py not found")
             print(f"Missing file: {convert_script}")
-            return
-
-        if not send_script.exists():
-            self.set_status("send_sequence_tcp.py not found")
-            print(f"Missing file: {send_script}")
             return
 
         try:
@@ -326,30 +388,26 @@ class ArduinoConnection(QObject):
                 print("convert_throttle.py STDERR:")
                 print(convert_result.stderr)
 
+            if not converted_file.exists():
+                self.set_status("Converted sequence file not found")
+                print(f"Missing converted file: {converted_file}")
+                return
+
             self.set_status("Sequence converted")
 
             self.set_status("Sending sequence...")
-            print("Running send_sequence_tcp.py")
 
-            send_result = subprocess.run(
-                [sys.executable, str(send_script)],
-                cwd=project_dir,
-                text=True,
-                capture_output=True,
-                check=True,
+            result = self.send_converted_sequence_csv(converted_file)
+
+            self.set_status(
+                f"Sequence sent: {result['command_count']} commands, "
+                f"{result['payload_size']} bytes"
             )
 
-            if send_result.stdout:
-                print("send_sequence_tcp.py STDOUT:")
-                print(send_result.stdout)
-
-            if send_result.stderr:
-                print("send_sequence_tcp.py STDERR:")
-                print(send_result.stderr)
-
-            self.set_status("Sequence sent")
+            self.start_sequence_playhead()
 
         except subprocess.CalledProcessError as error:
+            self.stop_sequence_playhead()
             self.set_status("Upload failed")
 
             print("Upload failed")
@@ -365,6 +423,7 @@ class ArduinoConnection(QObject):
                 print(error.stderr)
 
         except Exception as error:
+            self.stop_sequence_playhead()
             self.set_status("Upload failed")
             print(f"Upload failed: {error}")
 
@@ -428,7 +487,7 @@ class ArduinoConnection(QObject):
 
     def send_converted_sequence_csv(self, filename="converted_sequence.csv"):
         if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.status_label.setText("Not connected")
+            self.set_status("Not connected")
             raise RuntimeError("Not connected to Arduino")
 
         commands = self.load_converted_sequence_csv(filename)
@@ -449,10 +508,6 @@ class ArduinoConnection(QObject):
         self.socket.write(size_header)
         self.socket.write(payload)
         self.socket.flush()
-
-        self.status_label.setText(
-            f"Sent {len(commands)} commands, {len(payload)} bytes"
-        )
 
         print(f"Sent {len(commands)} commands")
         print(f"Payload size: {len(payload)} bytes")
