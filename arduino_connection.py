@@ -33,6 +33,7 @@ class ArduinoConnection(QObject):
         self.port_edit = window.findChild(QLineEdit, "portEdit")
         self.connect_button = window.findChild(QPushButton, "connectButton")
         self.ping_button = window.findChild(QPushButton, "PingButton")
+        self.calibrate_button = window.findChild(QPushButton, "calibrateButton")
         self.status_label = window.findChild(QLabel, "ConnectionLabel")
 
         self.select_sequence_button = window.findChild(QPushButton, "selectSequenceButton")
@@ -74,6 +75,8 @@ class ArduinoConnection(QObject):
             missing.append("connectButton")
         if self.ping_button is None:
             missing.append("PingButton")
+        if self.calibrate_button is None:
+            missing.append("calibrateButton")
         if self.status_label is None:
             missing.append("ConnectionLabel")
         if self.select_sequence_button is None:
@@ -96,6 +99,7 @@ class ArduinoConnection(QObject):
         self.set_status("Disconnected")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
+        self.calibrate_button.setEnabled(False)
         self.sequence_name_label.setText("No Sequence Loaded")
 
     def setup_socket(self):
@@ -107,6 +111,7 @@ class ArduinoConnection(QObject):
     def setup_buttons(self):
         self.connect_button.clicked.connect(self.connect_or_disconnect)
         self.ping_button.clicked.connect(self.ping_arduino)
+        self.calibrate_button.clicked.connect(self.calibrate_arduino)
         self.select_sequence_button.clicked.connect(self.select_throttle_sequence)
         self.upload_sequence_button.clicked.connect(self.upload_throttle_sequence)
 
@@ -255,6 +260,7 @@ class ArduinoConnection(QObject):
             self.socket.abort()
             self.connect_button.setText("Connect")
             self.ping_button.setEnabled(False)
+            self.calibrate_button.setEnabled(False)
             return
 
         ip, port = self.get_ip_and_port()
@@ -265,6 +271,7 @@ class ArduinoConnection(QObject):
         self.set_status(f"Connecting to {ip}:{port}...")
         self.connect_button.setText("Cancel")
         self.ping_button.setEnabled(False)
+        self.calibrate_button.setEnabled(False)
 
         self.socket.abort()
         self.socket.connectToHost(ip, port)
@@ -280,10 +287,23 @@ class ArduinoConnection(QObject):
 
         self.set_status("Ping sent")
 
+    def calibrate_arduino(self):
+        if self.socket.state() != QAbstractSocket.ConnectedState:
+            self.set_status("Not connected")
+            print("Cannot calibrate: not connected")
+            return
+
+        self.socket.write(struct.pack("<H", 0xCA1B))
+        self.socket.flush()
+
+        self.set_status("Calibration command sent")
+        print("Calibration command sent")
+
     def on_connected(self):
         self.set_status("Connected")
         self.connect_button.setText("Disconnect")
         self.ping_button.setEnabled(True)
+        self.calibrate_button.setEnabled(True)
         print("Connected to Arduino")
 
     def on_disconnected(self):
@@ -291,6 +311,7 @@ class ArduinoConnection(QObject):
         self.set_status("Disconnected")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
+        self.calibrate_button.setEnabled(False)
         print("Disconnected from Arduino")
 
     def on_error(self, socket_error):
@@ -299,6 +320,7 @@ class ArduinoConnection(QObject):
         self.set_status(f"Error: {error_text}")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
+        self.calibrate_button.setEnabled(False)
         print(f"Socket error: {error_text}")
 
     def on_ready_read(self):
@@ -312,6 +334,12 @@ class ArduinoConnection(QObject):
         if text == "PONG":
             self.set_status("Arduino replied: PONG")
             print("Arduino replied: PONG")
+        elif text == "CALIBRATING":
+            self.set_status("Arduino calibrating...")
+            print("Arduino calibrating...")
+        elif text == "CALIBRATION_DONE":
+            self.set_status("Calibration complete")
+            print("Calibration complete")
         else:
             self.set_status(f"Arduino: {text}")
             print(f"Arduino TCP data: {data}")
