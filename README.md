@@ -38,11 +38,19 @@ This project uses:
 
 ```text
 SwanThrottleControl_GUI/
-├── main.py
-├── main.ui
-├── about.ui
-├── LICENSE
+├── main.py                  # Application entry point
+├── arduino_connection.py    # TCP connection, graphing, sequence upload logic
+├── convert_throttle.py      # Converts throttle CSV files into command sequences
+├── send_sequence_tcp.py     # Standalone TCP sequence sender
+├── converted_sequence.csv   # Generated converted throttle sequence
+├── main.ui                  # Main Qt Designer UI file
+├── ui_main.py               # Generated Python UI file
+├── about.ui                 # About window UI file
+├── pyproject.toml           # Python project/dependency configuration
 ├── README.md
-└── assets/
-    ├── app_icon.png
-    └── swandoc_logo.png
+├── LICENSE
+├── assets/
+│   ├── app_icon.png
+│   └── swandoc_logo.png
+└── .qtcreator/
+    └── Python_3_14_6venv/   # Local Qt Creator virtual environment
