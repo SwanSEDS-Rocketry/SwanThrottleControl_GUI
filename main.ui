@@ -190,9 +190,9 @@
     <widget class="QWidget" name="horizontalLayoutWidget_2">
      <property name="geometry">
       <rect>
-       <x>260</x>
+       <x>230</x>
        <y>290</y>
-       <width>239</width>
+       <width>251</width>
        <height>31</height>
       </rect>
      </property>
@@ -228,7 +228,7 @@
        <x>20</x>
        <y>320</y>
        <width>201</width>
-       <height>29</height>
+       <height>26</height>
       </rect>
      </property>
      <property name="text">
