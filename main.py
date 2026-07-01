@@ -2,10 +2,14 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QIODevice
-from PySide6.QtUiTools import QUiLoader
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
-from PySide6.QtNetwork import QTcpSocket, QAbstractSocket
 from PySide6.QtGui import QAction
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+
+from arduino_connection import ArduinoConnection
+
+
+APP_TITLE = "SwanSEDS | Kilgharrah Throttle Control Software v0.1.1"
 
 
 def load_ui_file(file_name, parent=None):
@@ -27,7 +31,7 @@ def load_ui_file(file_name, parent=None):
 
 def load_main_window():
     window = load_ui_file("main.ui")
-    window.setWindowTitle("SwanSEDS | Kilgharrah Throttle Control Software v0.1.1")
+    window.setWindowTitle(APP_TITLE)
     return window
 
 
@@ -36,6 +40,7 @@ def load_about_window(parent=None):
     about_window.setWindowTitle("About")
 
     close_button = about_window.findChild(QPushButton, "closeButton")
+
     if close_button is not None:
         close_button.clicked.connect(about_window.close)
 
@@ -106,110 +111,6 @@ def apply_light_theme(app):
     """)
 
 
-class ArduinoConnection:
-    def __init__(self, window):
-        self.window = window
-        self.socket = QTcpSocket()
-
-        self.ip_edit = window.findChild(QLineEdit, "IPEdit")
-        self.port_edit = window.findChild(QLineEdit, "portEdit")
-        self.connect_button = window.findChild(QPushButton, "connectButton")
-        self.ping_button = window.findChild(QPushButton, "PingButton")
-        self.status_label = window.findChild(QLabel, "ConnectionLabel")
-
-        self.check_widgets_exist()
-        self.setup_defaults()
-        self.setup_socket()
-        self.setup_buttons()
-
-    def check_widgets_exist(self):
-        missing = []
-
-        if self.ip_edit is None:
-            missing.append("IPEdit")
-        if self.port_edit is None:
-            missing.append("portEdit")
-        if self.connect_button is None:
-            missing.append("connectButton")
-        if self.ping_button is None:
-            missing.append("PingButton")
-        if self.status_label is None:
-            missing.append("ConnectionLabel")
-
-        if missing:
-            raise RuntimeError(f"Could not find these widgets in main.ui: {', '.join(missing)}")
-
-    def setup_defaults(self):
-        self.ip_edit.setText("192.168.10.2")
-        self.port_edit.setText("5000")
-        self.status_label.setText("Disconnected")
-        self.ping_button.setEnabled(False)
-
-    def setup_socket(self):
-        self.socket.connected.connect(self.on_connected)
-        self.socket.disconnected.connect(self.on_disconnected)
-        self.socket.readyRead.connect(self.on_ready_read)
-        self.socket.errorOccurred.connect(self.on_error)
-
-    def setup_buttons(self):
-        self.connect_button.clicked.connect(self.connect_or_disconnect)
-        self.ping_button.clicked.connect(self.ping_arduino)
-
-    def connect_or_disconnect(self):
-        if self.socket.state() == QAbstractSocket.ConnectedState:
-            self.socket.disconnectFromHost()
-            return
-
-        ip = self.ip_edit.text().strip()
-        port_text = self.port_edit.text().strip()
-
-        try:
-            port = int(port_text)
-        except ValueError:
-            self.status_label.setText("Invalid port")
-            return
-
-        if not 1 <= port <= 65535:
-            self.status_label.setText("Port must be 1-65535")
-            return
-
-        self.status_label.setText(f"Connecting to {ip}:{port}...")
-        self.socket.abort()
-        self.socket.connectToHost(ip, port)
-
-    def send_command(self, command):
-        if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.status_label.setText("Not connected")
-            return
-
-        message = command.strip() + "\n"
-        self.socket.write(message.encode("utf-8"))
-        self.status_label.setText(f"Sent: {command}")
-
-    def ping_arduino(self):
-        self.send_command("PING")
-
-    def on_connected(self):
-        self.status_label.setText("Connected")
-        self.connect_button.setText("Disconnect")
-        self.ping_button.setEnabled(True)
-
-    def on_disconnected(self):
-        self.status_label.setText("Disconnected")
-        self.connect_button.setText("Connect")
-        self.ping_button.setEnabled(False)
-
-    def on_ready_read(self):
-        while self.socket.canReadLine():
-            line = bytes(self.socket.readLine()).decode("utf-8", errors="replace").strip()
-            self.status_label.setText(f"Arduino: {line}")
-            print(f"Arduino replied: {line}")
-
-    def on_error(self):
-        self.status_label.setText(f"Error: {self.socket.errorString()}")
-        print(f"Socket error: {self.socket.errorString()}")
-
-
 class MenuActions:
     def __init__(self, window):
         self.window = window
@@ -269,6 +170,7 @@ def apply_window_specific_styles(window):
     footer_frame = window.findChild(QFrame, "footerFrame")
 
     footer_title = window.findChild(QLabel, "footerTitleLabel")
+
     if footer_title is None:
         footer_title = window.findChild(QLabel, "footerTitellabel")
 
@@ -303,7 +205,7 @@ def apply_window_specific_styles(window):
         """)
 
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
 
     apply_light_theme(app)
@@ -314,6 +216,14 @@ if __name__ == "__main__":
     arduino = ArduinoConnection(window)
     menu_actions = MenuActions(window)
 
+    # Keep references alive so Qt does not garbage collect them.
+    window.arduino_connection = arduino
+    window.menu_actions = menu_actions
+
     window.show()
 
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

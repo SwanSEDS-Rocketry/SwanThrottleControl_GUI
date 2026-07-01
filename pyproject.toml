@@ -2,4 +2,4 @@
 name = "SwanThrottleGUI"
 
 [tool.pyside6-project]
-files = ["about.ui", "main.py", "main.ui"]
+files = ["about.ui", "arduino_connection.py", "main.py", "main.ui"]
