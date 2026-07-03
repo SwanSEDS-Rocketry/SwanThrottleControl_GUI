@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>902</width>
+    <width>901</width>
     <height>626</height>
    </rect>
   </property>
@@ -308,7 +308,7 @@
          </font>
         </property>
         <property name="text">
-         <string>Version 0.2.3</string>
+         <string>Version 0.3.1</string>
         </property>
         <property name="alignment">
          <set>Qt::AlignmentFlag::AlignCenter</set>
@@ -330,83 +330,113 @@
      <rect>
       <x>9</x>
       <y>359</y>
-      <width>411</width>
+      <width>351</width>
       <height>111</height>
      </rect>
     </property>
     <property name="title">
      <string>Connection</string>
     </property>
-    <widget class="QWidget" name="gridLayoutWidget_2">
+    <widget class="QLabel" name="ConnectionLabel">
      <property name="geometry">
       <rect>
-       <x>10</x>
-       <y>30</y>
-       <width>391</width>
-       <height>71</height>
+       <x>184</x>
+       <y>70</y>
+       <width>151</width>
+       <height>28</height>
       </rect>
      </property>
-     <layout class="QGridLayout" name="gridLayout_4">
-      <item row="1" column="1">
-       <widget class="QLabel" name="StatusLabel">
-        <property name="text">
-         <string>Status:</string>
-        </property>
-        <property name="alignment">
-         <set>Qt::AlignmentFlag::AlignCenter</set>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="0">
-       <layout class="QHBoxLayout" name="horizontalLayout_5">
-        <item>
-         <widget class="QLabel" name="label">
-          <property name="text">
-           <string>IP:</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLineEdit" name="IPEdit"/>
-        </item>
-       </layout>
-      </item>
-      <item row="0" column="1">
-       <widget class="QPushButton" name="connectButton">
-        <property name="text">
-         <string>Connect</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <layout class="QHBoxLayout" name="horizontalLayout_6">
-        <item>
-         <widget class="QLabel" name="label_2">
-          <property name="text">
-           <string>Port:</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLineEdit" name="portEdit"/>
-        </item>
-       </layout>
-      </item>
-      <item row="1" column="2">
-       <widget class="QLabel" name="ConnectionLabel">
-        <property name="text">
-         <string>TextLabel</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="2">
-       <widget class="QPushButton" name="PingButton">
-        <property name="text">
-         <string>Ping</string>
-        </property>
-       </widget>
-      </item>
-     </layout>
+     <property name="text">
+      <string>TextLabel</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="PingButton">
+     <property name="geometry">
+      <rect>
+       <x>266</x>
+       <y>28</y>
+       <width>80</width>
+       <height>29</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Ping</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label">
+     <property name="geometry">
+      <rect>
+       <x>11</x>
+       <y>29</y>
+       <width>29</width>
+       <height>29</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>IP:</string>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="IPEdit">
+     <property name="geometry">
+      <rect>
+       <x>47</x>
+       <y>29</y>
+       <width>131</width>
+       <height>28</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label_2">
+     <property name="geometry">
+      <rect>
+       <x>11</x>
+       <y>70</y>
+       <width>29</width>
+       <height>28</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Port:</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="connectButton">
+     <property name="geometry">
+      <rect>
+       <x>180</x>
+       <y>28</y>
+       <width>80</width>
+       <height>29</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Connect</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="StatusLabel">
+     <property name="geometry">
+      <rect>
+       <x>120</x>
+       <y>70</y>
+       <width>80</width>
+       <height>28</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Status:</string>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignmentFlag::AlignCenter</set>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="portEdit">
+     <property name="geometry">
+      <rect>
+       <x>47</x>
+       <y>70</y>
+       <width>81</width>
+       <height>28</height>
+      </rect>
+     </property>
     </widget>
    </widget>
    <widget class="QGroupBox" name="groupBox_4">
@@ -414,7 +444,7 @@
      <rect>
       <x>10</x>
       <y>470</y>
-      <width>411</width>
+      <width>151</width>
       <height>81</height>
      </rect>
     </property>
@@ -438,9 +468,9 @@
    <widget class="QGroupBox" name="groupBox_5">
     <property name="geometry">
      <rect>
-      <x>430</x>
+      <x>520</x>
       <y>360</y>
-      <width>251</width>
+      <width>161</width>
       <height>191</height>
      </rect>
     </property>
@@ -521,7 +551,7 @@
     <widget class="QLabel" name="label_14">
      <property name="geometry">
       <rect>
-       <x>360</x>
+       <x>381</x>
        <y>-1</y>
        <width>120</width>
        <height>30</height>
@@ -584,13 +614,89 @@
     <zorder>horizontalLayoutWidget</zorder>
     <zorder>label_14</zorder>
    </widget>
+   <widget class="QGroupBox" name="errorGroup">
+    <property name="geometry">
+     <rect>
+      <x>170</x>
+      <y>470</y>
+      <width>341</width>
+      <height>81</height>
+     </rect>
+    </property>
+    <property name="title">
+     <string>Error</string>
+    </property>
+    <widget class="QTextEdit" name="errorDisplay">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>25</y>
+       <width>321</width>
+       <height>31</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string>QTextEdit {
+    background-color: #ffe6e6;
+    color: #8b0000;
+    font-family: Consolas, Courier New, monospace;
+    font-size: 9pt;
+}</string>
+     </property>
+     <property name="readOnly">
+      <bool>true</bool>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="popOutErrorButton">
+     <property name="geometry">
+      <rect>
+       <x>180</x>
+       <y>57</y>
+       <width>71</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Pop Out</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="clearErrorButton">
+     <property name="geometry">
+      <rect>
+       <x>260</x>
+       <y>57</y>
+       <width>71</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Clear</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QLabel" name="armIndicator">
+    <property name="geometry">
+     <rect>
+      <x>395</x>
+      <y>400</y>
+      <width>80</width>
+      <height>51</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>DISARMED</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignmentFlag::AlignCenter</set>
+    </property>
+   </widget>
   </widget>
   <widget class="QMenuBar" name="menuBar">
    <property name="geometry">
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>902</width>
+     <width>901</width>
      <height>25</height>
     </rect>
    </property>

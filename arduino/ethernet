@@ -1,0 +1,1201 @@
+/*
+  SwanSEDS Liquid engine team
+  Comms/Ethernet board -- the middleman between the laptop, the Motor board,
+  and the Encoder board.
+
+  BOARD: Arduino Mega + Arduino Ethernet Shield Rev2.
+  This uses hardware Serial1/Serial2 for the Motor and Encoder links instead
+  of SoftwareSerial. That's a deliberate hardware choice: a single
+  SoftwareSerial instance can only receive on one link at a time, but this
+  board needs to receive from BOTH Motor (acks) and Encoder (continuous
+  telemetry) at once, especially while a throttle sequence is running.
+  Separate hardware UARTs receive independently with no risk of dropped
+  bytes on either link, and the Mega's much larger SRAM also removes the
+  memory pressure the Uno was hitting.
+
+  Responsibilities:
+    - Talks to the laptop over Ethernet (TCP for commands/sequences, UDP for
+      telemetry + recalibrate).
+    - Talks to the Motor board over Serial1 with a framed protocol: sends
+      CAL_START / CAL_STOP / ESTOP / RUN_SEQ commands, receives acks. This
+      board NEVER touches STEP/DIR/ENA directly -- Motor board owns the
+      driver.
+    - Talks to the Encoder board over Serial2, which streams continuously
+      once ENC_CAL_PIN is raised (done once at boot and left high). Runs the
+      sliding-window stop-detector during calibration, and during throttle
+      sequences forwards every new encoder sample to the laptop live over
+      UDP.
+
+  Wiring (Ethernet Shield Rev2 uses the ICSP header for SPI, plus D10 as the
+  W5500 chip-select and D4 as the SD chip-select -- both boards, but D11-13
+  are free for other use on a Mega since SPI runs over ICSP):
+    - Serial1: TX1(18) -> Motor board RX(3), RX1(19) <- Motor board TX(2)
+    - Serial2: TX2(16) -> Encoder board RX(2), RX2(17) <- Encoder board TX(3)
+    - A0        -> Encoder board cal_Pin (driven HIGH once at boot)
+*/
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+#include <SD.h>
+#include <Wire.h>
+#include <RTClib.h>   // Adafruit RTClib -- supports the PCF8523 directly
+#include <math.h>     // NAN, lround() for the throttle percent <-> count conversion
+
+// ----------------------------
+// Board links (hardware serial -- no SoftwareSerial needed on a Mega)
+// ----------------------------
+
+#define motorLink   Serial1
+#define encoderLink Serial2
+
+const int ENC_CAL_PIN = A0;   // -> Encoder board cal_Pin; held HIGH permanently
+
+const int ETH_CS_PIN = 10; // W5500 chip-select
+const int SD_CS_PIN  = 4;  // shield's SD card chip-select
+
+// PCF8523 RTC over I2C (Mega's dedicated SDA=20/SCL=21 pins -- no conflict
+// with anything else on this board). Used ONLY to name log files uniquely
+// across power cycles; individual sample rows still use millis() since the
+// RTC's 1-second resolution is far coarser than the ~20ms encoder rate.
+RTC_PCF8523 rtc;
+bool rtcReady = false;
+
+// SD card is a local backup log, in case a UDP packet gets dropped or the
+// laptop disconnects mid-run. Every calibration and every throttle sequence
+// gets its own CSV file: "millis_ms,encoder_count" per line.
+bool sdReady = false;
+File logFile;
+bool loggingActive = false;
+
+// ----------------------------
+// Voltage analogue inputs
+// ----------------------------
+// A0 is already used for ENC_CAL_PIN, so voltage sensing starts at A1.
+
+const int VOLTAGE_5_PIN  = A1;
+const int VOLTAGE_24_PIN = A2;
+const int VOLTAGE_48_PIN = A3;
+
+
+// ============================================================
+// Motor-link framed protocol (must match Motor sketch exactly)
+// Frame: 0xAA 0x55 CMD LEN payload[LEN] CHK
+// ============================================================
+
+const uint8_t CMD_CAL_START      = 0x01;
+const uint8_t CMD_CAL_STOP       = 0x02;
+const uint8_t CMD_ESTOP          = 0x03;
+const uint8_t CMD_RUN_SEQ_START  = 0x04;
+const uint8_t CMD_RUN_SEQ_EXECUTE = 0x05;
+const uint8_t CMD_MANUAL_THROTTLE = 0x06; // payload: [target_percent as float, 4 bytes]
+
+const uint8_t ACK_CAL_DONE       = 0x81;
+const uint8_t ACK_ESTOPPED       = 0x82;
+const uint8_t ACK_SEQ_RECEIVED   = 0x83;
+const uint8_t ACK_SEQ_DONE       = 0x84;
+const uint8_t ACK_ERROR          = 0x8F;
+
+// Encoder reset: two consecutive 0xFE bytes tell the Encoder board to zero
+// its count. Sent once, right after a SUCCESSFUL calibration, so 0 becomes
+// the home reference. Must match the Encoder sketch's RESET_MARKER.
+const uint8_t ENCODER_RESET_MARKER = 0xFE;
+
+// External start-permission input: a throttle sequence is only allowed to
+// actually begin moving once this pin reads HIGH. Driven by other test
+// system control hardware -- this board never drives it. Same physical pin
+// as the arm indicator below -- "armed" and "start permission" are the same
+// signal, just named for two different consumers (sequence gating vs. the
+// GUI's arm/disarm display).
+const int START_PIN = 22;
+const int ARM_PIN = START_PIN;
+const unsigned long START_PIN_TIMEOUT_MS = 5UL * 60UL * 1000UL; // abort if never seen HIGH
+
+bool systemArmed = false;
+
+// ----------------------------
+// Calibration parameters (Comms is the brain; Motor just executes)
+//
+// The throttle valve has TWO hard stops, not one: driving CAL_DIRECTION
+// finds the low-throttle idle stop (defined as CAL_STOP1_PERCENT, typically
+// 20% -- not fully closed), and driving the opposite way finds the
+// full-open stop (CAL_STOP2_PERCENT, 100%). Calibration homes to stop 1
+// first, zeroes the encoder there, then drives all the way to stop 2 and
+// records that count as the full span. Manual throttle positioning can't
+// work until both references exist.
+// ----------------------------
+
+const uint8_t  CAL_DIRECTION        = HIGH;  // direction that finds the 20% (idle) stop first
+const uint32_t CAL_INTERVAL_US      = 600;   // step period during homing (larger = slower)
+const uint32_t CAL_BACKOFF_STEPS    = 200;   // back off the FINAL (100%) hard stop after homing
+
+const float CAL_STOP1_PERCENT = 20.0;  // throttle % at the stop found driving CAL_DIRECTION
+const float CAL_STOP2_PERCENT = 100.0; // throttle % at the stop found driving the opposite way
+
+// Sliding-window stop detector (validated on the bench):
+//  - held/stalled: 20-sample window span stays < ~140 counts
+//  - moving:       window span > ~370 counts
+const uint8_t  CAL_WIN            = 20;
+const int16_t  CAL_SPAN_THRESHOLD = 200;
+const int16_t  CAL_MOVE_THRESHOLD = 200;
+const long     CAL_MAX_JUMP       = 300;
+const unsigned long CAL_TIMEOUT_MS = 30000; // abort (ESTOP) if no stop detected in time
+
+// Calibration results. calStop1Count is always 0 by construction (the
+// encoder is zeroed the instant stop 1 is found). calStop2Count is the raw
+// span, in encoder counts, from stop 1 to stop 2. Neither is meaningful
+// until calibrated == true.
+bool calibrated = false;
+const int16_t calStop1Count = 0;
+int16_t calStop2Count = 0;
+
+// ----------------------------
+// TCP command constants
+// ----------------------------
+
+constexpr uint16_t TCP_PING_COMMAND      = 0xFFFF;
+constexpr uint16_t TCP_CALIBRATE_COMMAND = 0xCA1B;
+constexpr uint16_t TCP_MANUAL_THROTTLE_COMMAND = 0x4D54;  // 'MT'
+
+// ----------------------------
+// Sequence buffer. Sequences are now executed here via closed-loop seeking
+// (see executeSequence()), not forwarded to Motor for open-loop execution --
+// Motor's own step counts assume a generic geometry, not this unit's real
+// calibrated span, so they can't be trusted directly. A 512-byte buffer is
+// fine on a Mega's 8KB SRAM (it was the thing that overflowed the Uno).
+// ----------------------------
+
+constexpr size_t sequence_buffer_max = 512;
+constexpr size_t STEP_COMMAND_SIZE = 17;     // 4 + 4 + 1 + 4 + 4
+
+uint8_t sequence_buffer[sequence_buffer_max];
+
+struct StepCommand {
+  uint32_t duration_ms;
+  int32_t steps;          // no longer used -- kept only to match the wire format
+  uint8_t direction;      // no longer used -- direction is derived from calibration instead
+  uint32_t interval_us;   // used as the seek speed for this waypoint
+  float commanded_throttle; // fraction 0.0-1.0; the field that actually matters now
+};
+
+StepCommand getCommand(size_t index) {
+  StepCommand cmd;
+  size_t offset = index * STEP_COMMAND_SIZE;
+  memcpy(&cmd.duration_ms, sequence_buffer + offset, 4); offset += 4;
+  memcpy(&cmd.steps, sequence_buffer + offset, 4); offset += 4;
+  memcpy(&cmd.direction, sequence_buffer + offset, 1); offset += 1;
+  memcpy(&cmd.interval_us, sequence_buffer + offset, 4); offset += 4;
+  memcpy(&cmd.commanded_throttle, sequence_buffer + offset, 4);
+  return cmd;
+}
+
+bool running_throttle_sequence = false;
+bool calibrating_throttle = false;
+bool manual_seek_active = false;
+
+// ----------------------------
+// Manual throttle seek tuning
+//
+// No deceleration profiling: the seek steps at the same constant speed as
+// calibration (CAL_INTERVAL_US) all the way in, then stops. Encoder samples
+// arrive ~every 20ms, and at CAL_INTERVAL_US the motor covers roughly
+// 15-20 counts per sample on this hardware (per bench data), so an exact
+// stop isn't possible -- expect the final position to land within roughly
+// one sample's travel of the tolerance band, not exactly on it. If tighter
+// positioning is needed, the fix is slowing down (or actively decelerating)
+// as the target approaches -- not implemented here.
+// ----------------------------
+
+const int16_t MANUAL_SEEK_TOLERANCE_COUNTS = 15; // "close enough" band
+const unsigned long MANUAL_SEEK_TIMEOUT_MS = 30000; // abort if unreachable in time
+
+
+// ----------------------------
+// Networking globals
+// ----------------------------
+
+byte mac[] = { 0xA8, 0x61, 0x0A, 0xAE, 0xB3, 0x70 };
+byte ip[] = { 192, 168, 10, 2 };
+uint16_t port = 5000;
+
+byte remote_ip[] = { 192, 168, 10, 1 };
+uint16_t remote_port = 7080;
+
+EthernetServer server = EthernetServer(port);
+EthernetClient client;
+EthernetUDP udp;
+
+enum class UDPCommand : int8_t {
+  NONE = 0,
+  RECALIBRATE = 1,
+  ESTOP = 2,
+};
+
+// ----------------------------
+// Latest encoder reading, kept up to date by pollEncoder() every loop().
+// ----------------------------
+
+int16_t latestEncoderCount = 0;
+bool    encoderEverSeen = false;
+
+// ----------------------------
+// Setup
+// ----------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  motorLink.begin(38400);
+  encoderLink.begin(38400);
+
+  pinMode(ENC_CAL_PIN, OUTPUT);
+  digitalWrite(ENC_CAL_PIN, HIGH);  // encoder streams continuously from now on
+
+  // Driven by external test system control hardware -- plain INPUT since
+  // that hardware actively drives both HIGH and LOW. Switch to INPUT_PULLUP
+  // if it's an open-collector/active-low-only signal instead.
+  pinMode(START_PIN, INPUT);
+
+  // Ethernet and the SD card share the SPI bus -- hold both chip-selects
+  // HIGH before either library touches the bus, so they don't contend
+  // during init.
+  pinMode(ETH_CS_PIN, OUTPUT);
+  digitalWrite(ETH_CS_PIN, HIGH);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  // Some cards (especially older/cheaper ones, or long shield traces) don't
+  // reliably init at full SPI speed. Try full speed first; if that fails,
+  // retry once at half speed before giving up.
+  if (SD.begin(SD_CS_PIN)) {
+    sdReady = true;
+    Serial.println("SD card ready (full speed)");
+  } else {
+    Serial.println("SD card init failed at full speed, retrying at half speed...");
+    if (SD.begin(SPI_HALF_SPEED, SD_CS_PIN)) {
+      sdReady = true;
+      Serial.println("SD card ready (half speed)");
+    } else {
+      sdReady = false;
+      Serial.println("SD card init FAILED -- continuing without local logging");
+      Serial.println("Check: card formatted FAT16/FAT32 (not exFAT), fully seated, and <=32GB.");
+    }
+  }
+
+  Wire.begin();
+  if (rtc.begin()) {
+    rtcReady = true;
+    if (!rtc.initialized() || rtc.lostPower()) {
+      Serial.println("RTC lost power / not set -- setting from compile time");
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    DateTime now = rtc.now();
+    Serial.print("RTC time: ");
+    Serial.println(now.timestamp());
+  } else {
+    rtcReady = false;
+    Serial.println("RTC (PCF8523) not found -- log filenames will fall back to millis()");
+  }
+
+  Serial.println("Starting Ethernet...");
+  Ethernet.begin(mac, ip);
+  Serial.print("Arduino IP: ");
+  Serial.println(Ethernet.localIP());
+
+  udp.begin(port);
+  Serial.print("UDP started on port ");
+  Serial.println(port);
+
+  server.begin();
+  Serial.print("TCP server started on port ");
+  Serial.println(port);
+}
+
+void loop() {
+  // Keep the latest encoder reading fresh at all times.
+  pollEncoder();
+
+  // Announce arm/disarm state changes over TCP (throttled internally to
+  // 100ms). Note this pauses while blocked inside calibration/sequence/
+  // manual-seek, same as everything else driven from loop() -- but the
+  // sequence-start gate itself still reads the pin directly and live, so
+  // that safety check isn't affected by this announcement cadence.
+  updateArmedStateFromPin();
+
+  if (!running_throttle_sequence && !calibrating_throttle && !manual_seek_active) {
+    checkForTcpSequence();
+    checkForUdpCommand();
+  }
+  sendUdpTelemetry();
+}
+
+// ----------------------------
+// TCP helper
+// ----------------------------
+
+void sendTcpLine(const char* message) {
+  if (client && client.connected()) {
+    client.print(message);
+    client.print("\n");
+    client.flush();
+  }
+}
+
+// ----------------------------
+// Arm indicator helpers
+//
+// Pin 22 HIGH = ARMED. Sent to the laptop as plain TCP lines ("ARMED" /
+// "DISARMED"), the same channel as other status messages -- the Python GUI
+// watches for these to drive its arm indicator and to gate whether it will
+// even attempt to start a sequence.
+// ----------------------------
+
+bool readArmPin() {
+  return digitalRead(ARM_PIN) == HIGH;
+}
+
+void sendArmStateTcp() {
+  if (readArmPin()) {
+    sendTcpLine("ARMED");
+  } else {
+    sendTcpLine("DISARMED");
+  }
+}
+
+void setArmedState(bool armed) {
+  systemArmed = armed;
+
+  if (systemArmed) {
+    Serial.println("System ARMED");
+    sendTcpLine("ARMED");
+  } else {
+    Serial.println("System DISARMED");
+    sendTcpLine("DISARMED");
+  }
+}
+
+// Call every loop() iteration. Polls the pin at most every 100ms and only
+// sends a TCP line when the state actually changes (plus once on the very
+// first check), so this doesn't spam the connection every iteration.
+void updateArmedStateFromPin() {
+  static unsigned long last_arm_check = 0;
+  static bool last_sent_arm_state = false;
+  static bool first_run = true;
+
+  const unsigned long arm_check_interval_ms = 100;
+
+  if (millis() - last_arm_check < arm_check_interval_ms) {
+    return;
+  }
+
+  last_arm_check = millis();
+
+  bool current_arm_state = readArmPin();
+
+  systemArmed = current_arm_state;
+
+  if (first_run || current_arm_state != last_sent_arm_state) {
+    first_run = false;
+    last_sent_arm_state = current_arm_state;
+
+    if (current_arm_state) {
+      Serial.println("System ARMED");
+      sendTcpLine("ARMED");
+    } else {
+      Serial.println("System DISARMED");
+      sendTcpLine("DISARMED");
+    }
+  }
+}
+
+// ============================================================
+// Motor-link helpers
+// ============================================================
+
+void writeMotorFrame(uint8_t cmd, const uint8_t* payload, uint8_t len) {
+  uint8_t chk = cmd + len;
+  motorLink.write((uint8_t)0xAA);
+  motorLink.write((uint8_t)0x55);
+  motorLink.write(cmd);
+  motorLink.write(len);
+  for (uint8_t i = 0; i < len; i++) {
+    motorLink.write(payload[i]);
+    chk += payload[i];
+  }
+  motorLink.write(chk);
+}
+
+void writeU32LE(uint8_t* p, uint32_t v) {
+  p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+void writeU16LE(uint8_t* p, uint16_t v) {
+  p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+}
+
+// Feed one incoming byte from Motor into the small-frame parser. Returns
+// true when a complete, checksum-valid frame is ready.
+bool feedMotorByte(uint8_t b, uint8_t &cmdOut, uint8_t* payloadOut, uint8_t &lenOut) {
+  static uint8_t st = 0, cmd = 0, expectedLen = 0, idx = 0, chk = 0;
+  static uint8_t payload[8];
+
+  switch (st) {
+    case 0: st = (b == 0xAA) ? 1 : 0; break;
+    case 1: st = (b == 0x55) ? 2 : (b == 0xAA ? 1 : 0); break;
+    case 2: cmd = b; chk = b; st = 3; break;
+    case 3:
+      expectedLen = b; idx = 0; chk += b;
+      st = (expectedLen == 0) ? 5 : 4;
+      break;
+    case 4:
+      payload[idx++] = b; chk += b;
+      if (idx >= expectedLen) st = 5;
+      break;
+    case 5:
+      st = 0;
+      if (chk == b) {
+        cmdOut = cmd;
+        lenOut = expectedLen;
+        memcpy(payloadOut, payload, expectedLen);
+        return true;
+      }
+      break;
+  }
+  return false;
+}
+
+// Blocking wait (with timeout) for a specific ack from Motor. Simple case:
+// used when we don't need to do anything else while waiting (e.g. after
+// CAL_STOP, or after ESTOP).
+bool waitForMotorAck(uint8_t expectedAck, unsigned long timeout_ms) {
+  uint8_t cmd, len, payload[8];
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < timeout_ms) {
+    if (motorLink.available() > 0) {
+      if (feedMotorByte(motorLink.read(), cmd, payload, len)) {
+        if (cmd == ACK_ERROR) {
+          Serial.print("Motor reported error code ");
+          Serial.println(len > 0 ? payload[0] : 255);
+          return false;
+        }
+        if (cmd == expectedAck) return true;
+      }
+    }
+  }
+  Serial.println("Timed out waiting for motor ack");
+  return false;
+}
+
+// ----------------------------
+// Encoder frame parser (continuous, non-blocking)
+// Frame: 0xAA 0x55 <lo> <hi> <chk>, chk = (lo + hi) & 0xFF
+// ----------------------------
+
+bool readEncoderByte(uint8_t b, int16_t &value) {
+  static uint8_t st = 0, lo = 0, hi = 0;
+  switch (st) {
+    case 0: st = (b == 0xAA) ? 1 : 0; break;
+    case 1: st = (b == 0x55) ? 2 : (b == 0xAA ? 1 : 0); break;
+    case 2: lo = b; st = 3; break;
+    case 3: hi = b; st = 4; break;
+    case 4:
+      st = 0;
+      if ((uint8_t)(lo + hi) == b) {
+        value = (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+        return true;
+      }
+      break;
+  }
+  return false;
+}
+
+// Call every loop() iteration: drains whatever is waiting on the encoder
+// link and updates latestEncoderCount. Returns true if a NEW sample arrived
+// (so callers that want every sample, not just the latest, can react).
+bool pollEncoder() {
+  bool gotOne = false;
+  while (encoderLink.available() > 0) {
+    int16_t v;
+    if (readEncoderByte(encoderLink.read(), v)) {
+      latestEncoderCount = v;
+      encoderEverSeen = true;
+      gotOne = true;
+    }
+  }
+  return gotOne;
+}
+
+// Tell the Encoder board to zero its count. Sent only after a SUCCESSFUL
+// calibration, so 0 becomes the home reference for subsequent readings.
+void resetEncoderCount() {
+  encoderLink.write(ENCODER_RESET_MARKER);
+  encoderLink.write(ENCODER_RESET_MARKER);
+  Serial.println("Sent encoder reset command");
+}
+
+// Forward one encoder sample to the laptop immediately, as its own UDP
+// packet. Once calibrated, `value` is reported as throttle percent instead
+// of a raw count -- packed as centipercent (percent*100, e.g. 8543 =
+// 85.43%) so it still fits in an int16 and the packet size doesn't change.
+// Before calibration finishes (percent is undefined), the raw count is
+// sent instead. Byte 7, previously unused padding, now flags which one:
+// Format: ['E'] [millis uint32 LE] [value int16 LE] [isPercent 0/1] = 8 bytes.
+void sendEncoderSample(int16_t value) {
+  uint8_t pkt[8];
+  pkt[0] = 'E';
+  uint32_t t = millis();
+  pkt[1] = t & 0xFF; pkt[2] = (t >> 8) & 0xFF; pkt[3] = (t >> 16) & 0xFF; pkt[4] = (t >> 24) & 0xFF;
+
+  int16_t outValue = value;
+  uint8_t isPercent = 0;
+  if (calibrated) {
+    float percent = throttlePercentFromCount(value);
+    if (!isnan(percent)) {
+      outValue = (int16_t)lround(percent * 100.0f); // centipercent
+      isPercent = 1;
+    }
+  }
+
+  pkt[5] = outValue & 0xFF;
+  pkt[6] = (outValue >> 8) & 0xFF;
+  pkt[7] = isPercent;
+
+  udp.beginPacket(remote_ip, remote_port);
+  udp.write(pkt, 8);
+  udp.endPacket();
+}
+
+// ============================================================
+// Local SD backup logging (one CSV file per calibration run / sequence run)
+// ============================================================
+
+// Filenames always end in ".csv" (fits the SD library's 8.3 limit: 8-char
+// name, 3-char extension) using DDHHMMSS from the RTC to stay unique across
+// power cycles, e.g. "14153042.csv" = day 14, 15:30:42. Falls back to a
+// millis()-based name if the RTC isn't present. typeExt ("CAL"/"SEQ"/"MAN")
+// distinguishes the kind of run -- since it no longer fits in the
+// extension, it's written as the first line inside the file instead.
+void startLogging(const char* typeExt) {
+  if (!sdReady) return;
+
+  char filename[13];
+  if (rtcReady) {
+    DateTime now = rtc.now();
+    snprintf(filename, sizeof(filename), "%02d%02d%02d%02d.csv",
+             now.day(), now.hour(), now.minute(), now.second());
+  } else {
+    snprintf(filename, sizeof(filename), "%06lX.csv", millis() & 0xFFFFFFUL);
+  }
+
+  logFile = SD.open(filename, FILE_WRITE);
+  if (logFile) {
+    logFile.print("type,");
+    logFile.println(typeExt); // CAL / SEQ / MAN -- distinguishes the run now that it's not in the extension
+    // CAL runs log raw counts (calibration is what defines the percent
+    // mapping in the first place, so percent isn't meaningful yet); SEQ and
+    // MAN runs happen after calibration and log throttle percent instead.
+    if (strcmp(typeExt, "CAL") == 0) {
+      logFile.println("millis_ms,encoder_count");
+    } else {
+      logFile.println("millis_ms,throttle_percent");
+    }
+    loggingActive = true;
+    Serial.print("Logging to ");
+    Serial.println(filename);
+  } else {
+    loggingActive = false;
+    Serial.print("ERROR: could not open log file ");
+    Serial.println(filename);
+  }
+}
+
+// Logs raw encoder count while calibration is in progress (percent isn't
+// meaningful yet -- that's the whole point of calibration), and throttle
+// percent (20.00-100.00) for everything logged after calibration succeeds.
+void logSample(int16_t value) {
+  if (!loggingActive) return;
+  logFile.print(millis());
+  logFile.print(',');
+  if (calibrated) {
+    float percent = throttlePercentFromCount(value);
+    if (!isnan(percent)) {
+      logFile.println(percent, 2);
+    } else {
+      logFile.println(value); // fallback, shouldn't normally happen once calibrated
+    }
+  } else {
+    logFile.println(value);
+  }
+  logFile.flush(); // written promptly so a crash/reset doesn't lose the file
+}
+
+void stopLogging() {
+  if (!loggingActive) return;
+  logFile.close();
+  loggingActive = false;
+}
+
+// ============================================================
+// Calibration -- orchestrates Motor (via Serial1) and Encoder (via Serial2)
+// ============================================================
+
+// Runs the sliding-window stop-detector against whatever direction Motor is
+// currently stepping in (Comms must have already sent CAL_START). Blocks
+// until a stop is detected or timeout_ms elapses. On success, fills
+// stopValue with the encoder count at the moment the stop was declared and
+// returns true. Every sample seen is also logged to the SD card.
+bool detectStop(int16_t &stopValue, unsigned long timeout_ms) {
+  int16_t win[CAL_WIN];
+  uint8_t head = 0, count = 0;
+  int16_t startCount = 0, lastGood = 0;
+  bool seeded = false, hasMoved = false;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < timeout_ms) {
+    // Encoder and Motor links are independent hardware UARTs, so we can
+    // freely check both every iteration with no listen()-switching needed.
+    if (pollEncoder()) {
+      int16_t v = latestEncoderCount;
+      logSample(v);
+
+      if (!seeded) { startCount = v; lastGood = v; seeded = true; }
+
+      if (labs((long)v - lastGood) <= CAL_MAX_JUMP) {
+        lastGood = v;
+        if (labs((long)v - startCount) > CAL_MOVE_THRESHOLD) hasMoved = true;
+
+        win[head] = v;
+        head = (head + 1) % CAL_WIN;
+        if (count < CAL_WIN) count++;
+
+        if (count == CAL_WIN) {
+          int16_t lo = win[0], hi = win[0];
+          for (uint8_t i = 1; i < CAL_WIN; i++) {
+            if (win[i] < lo) lo = win[i];
+            if (win[i] > hi) hi = win[i];
+          }
+          if (hasMoved && (hi - lo) < CAL_SPAN_THRESHOLD) {
+            stopValue = v;
+            Serial.print("Hard stop detected at encoder count ");
+            Serial.println(v);
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+void startMotorStepping(uint8_t direction, uint32_t intervalUs) {
+  uint8_t payload[5];
+  payload[0] = direction ? 1 : 0;
+  writeU32LE(&payload[1], intervalUs);
+  writeMotorFrame(CMD_CAL_START, payload, 5);
+}
+
+// Two-point calibration: find the 20% (idle) stop driving CAL_DIRECTION,
+// zero the encoder there, then drive the opposite way to the 100% (full
+// open) stop and record the span. Returns true only if BOTH stops were
+// found and Motor acked the final backoff -- manual throttle positioning
+// requires both references to exist, so a partial/failed run leaves
+// `calibrated` false and refuses to guess.
+bool calibrateThrottle() {
+  calibrating_throttle = true;
+  calibrated = false;
+  Serial.println("Starting two-point throttle calibration...");
+
+  startLogging("CAL");
+
+  // --- Phase 1: find the 20% (idle) stop ---
+  startMotorStepping(CAL_DIRECTION, CAL_INTERVAL_US);
+  int16_t stop1Value;
+  if (!detectStop(stop1Value, CAL_TIMEOUT_MS)) {
+    Serial.println("ERROR: timeout finding 20% stop, sending ESTOP");
+    writeMotorFrame(CMD_ESTOP, nullptr, 0);
+    waitForMotorAck(ACK_ESTOPPED, 2000);
+    sendTcpLine("ERROR_CALIBRATION_TIMEOUT_STOP1");
+    stopLogging();
+    calibrating_throttle = false;
+    return false;
+  }
+
+  // This becomes the 20% reference: zero here so stop 2's count, read
+  // after this takes effect, is directly the 20%->100% span.
+  resetEncoderCount();
+
+  // --- Phase 2: reverse and drive all the way to the 100% (full open) stop ---
+  startMotorStepping(CAL_DIRECTION == HIGH ? LOW : HIGH, CAL_INTERVAL_US);
+  int16_t stop2Value;
+  if (!detectStop(stop2Value, CAL_TIMEOUT_MS)) {
+    Serial.println("ERROR: timeout finding 100% stop, sending ESTOP");
+    writeMotorFrame(CMD_ESTOP, nullptr, 0);
+    waitForMotorAck(ACK_ESTOPPED, 2000);
+    sendTcpLine("ERROR_CALIBRATION_TIMEOUT_STOP2");
+    stopLogging();
+    calibrating_throttle = false;
+    return false;
+  }
+
+  // Back off the FINAL hard stop (100% end) so the driver isn't left
+  // straining against it. No backoff is needed at stop 1 -- phase 2 already
+  // drives all the way across, well clear of it.
+  uint8_t stopPayload[4];
+  writeU32LE(stopPayload, CAL_BACKOFF_STEPS);
+  writeMotorFrame(CMD_CAL_STOP, stopPayload, 4);
+  bool ok = waitForMotorAck(ACK_CAL_DONE, 5000);
+
+  stopLogging();
+
+  if (!ok) {
+    sendTcpLine("ERROR_CALIBRATION_MOTOR_NO_ACK");
+    calibrating_throttle = false;
+    return false;
+  }
+
+  calStop2Count = stop2Value; // already relative to the stop-1 zero
+  calibrated = true;
+
+  Serial.print("Calibration complete. 20%->100% span = ");
+  Serial.print(calStop2Count);
+  Serial.println(" counts");
+
+  calibrating_throttle = false;
+  return true;
+}
+
+// Converts a raw encoder count to a throttle percentage using the two
+// calibrated references. Returns NAN if not yet calibrated.
+float throttlePercentFromCount(int16_t count) {
+  if (!calibrated || calStop2Count == 0) return NAN;
+  float frac = (float)(count - calStop1Count) / (float)(calStop2Count - calStop1Count);
+  return CAL_STOP1_PERCENT + frac * (CAL_STOP2_PERCENT - CAL_STOP1_PERCENT);
+}
+
+// Converts a target throttle percentage to the raw encoder count it
+// corresponds to. Only meaningful once calibrated.
+int16_t countFromThrottlePercent(float percent) {
+  float frac = (percent - CAL_STOP1_PERCENT) / (CAL_STOP2_PERCENT - CAL_STOP1_PERCENT);
+  return calStop1Count + (int16_t)lround(frac * (calStop2Count - calStop1Count));
+}
+
+// Figures out which physical direction increases vs. decreases the encoder
+// count, since that depends on encoder/wiring polarity and isn't fixed by
+// CAL_DIRECTION alone -- it's derived from the sign of calStop2Count, which
+// calibration already measured.
+void getSeekDirections(uint8_t &dirIncrease, uint8_t &dirDecrease) {
+  uint8_t phase2Direction = (CAL_DIRECTION == HIGH) ? LOW : HIGH;
+  bool phase2Increases = (calStop2Count > 0);
+  dirIncrease = phase2Increases ? phase2Direction : CAL_DIRECTION;
+  dirDecrease = phase2Increases ? CAL_DIRECTION : phase2Direction;
+}
+
+// Closed-loop seek to a target encoder count. Reuses the same CMD_CAL_START
+// continuous-stepping command calibration uses -- Motor needs no new
+// firmware for this. Steps at constant speed (stepIntervalUs) toward the
+// target, switching direction only when needed, until within
+// MANUAL_SEEK_TOLERANCE_COUNTS or timeout_ms elapses. Every sample is
+// logged and forwarded live. Returns true if the target was reached.
+bool seekToCount(int16_t targetCount, uint32_t stepIntervalUs, unsigned long timeout_ms) {
+  uint8_t dirIncrease, dirDecrease;
+  getSeekDirections(dirIncrease, dirDecrease);
+
+  uint8_t currentDir = 0xFF; // sentinel so the first direction command always sends
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < timeout_ms) {
+    if (pollEncoder()) {
+      int16_t v = latestEncoderCount;
+      logSample(v);
+      sendEncoderSample(v);
+
+      int16_t diff = targetCount - v;
+      if (labs((long)diff) <= MANUAL_SEEK_TOLERANCE_COUNTS) {
+        return true;
+      }
+
+      uint8_t desiredDir = (diff > 0) ? dirIncrease : dirDecrease;
+      if (desiredDir != currentDir) {
+        startMotorStepping(desiredDir, stepIntervalUs);
+        currentDir = desiredDir;
+      }
+    }
+  }
+  return false;
+}
+
+// ----------------------------
+// Manual throttle command -- a direct one-shot target sent to Motor,
+// bypassing the sequence upload/execute flow entirely.
+// ----------------------------
+
+void handleManualThrottleCommand() {
+  float target_percent = 0.0;
+
+  unsigned long start_time = millis();
+  const unsigned long timeout_ms = 1000;
+
+  while (client.available() < (int)sizeof(float)) {
+    if (millis() - start_time > timeout_ms) {
+      Serial.println("ERROR: manual throttle value timeout");
+      sendTcpLine("ERROR_MANUAL_THROTTLE_TIMEOUT");
+      return;
+    }
+
+    // Keep telemetry alive while waiting for the float payload to arrive.
+    pollEncoder();
+    sendUdpTelemetry();
+  }
+
+  client.read((uint8_t*)&target_percent, sizeof(float));
+
+  // Manual positioning is meaningless without both calibrated stops -- the
+  // conversion from percent to encoder count has no valid reference points
+  // otherwise, so refuse rather than move somewhere undefined.
+  if (!calibrated) {
+    Serial.println("ERROR: manual throttle requested before calibration completed");
+    sendTcpLine("ERROR_NOT_CALIBRATED");
+    return;
+  }
+
+  // Valid range is the calibrated span only: CAL_STOP1_PERCENT (the idle
+  // stop) to CAL_STOP2_PERCENT (100.00, full open). The valve physically
+  // can't go below the idle stop, so clamping down to 0 would target a
+  // position that doesn't exist.
+  if (target_percent < CAL_STOP1_PERCENT) target_percent = CAL_STOP1_PERCENT;
+  if (target_percent > CAL_STOP2_PERCENT) target_percent = CAL_STOP2_PERCENT; // hard ceiling: 100.00
+
+  int16_t target_count = countFromThrottlePercent(target_percent);
+
+  Serial.print("Manual throttle target: ");
+  Serial.print(target_percent, 2);
+  Serial.print("% (encoder count ");
+  Serial.print(target_count);
+  Serial.println(")");
+
+  manual_seek_active = true;
+  startLogging("MAN");
+
+  bool arrived = seekToCount(target_count, CAL_INTERVAL_US, MANUAL_SEEK_TIMEOUT_MS);
+
+  // Stop exactly where we are -- CMD_CAL_STOP with a 0 backoff reuses the
+  // same Motor-side handler as calibration's final stop, just with no
+  // reverse travel, making it a clean halt-in-place.
+  uint8_t stopPayload[4];
+  writeU32LE(stopPayload, 0);
+  writeMotorFrame(CMD_CAL_STOP, stopPayload, 4);
+  waitForMotorAck(ACK_CAL_DONE, 2000);
+
+  stopLogging();
+  manual_seek_active = false;
+
+  if (arrived) {
+    Serial.println("Manual throttle target reached");
+    sendTcpLine("MANUAL_THROTTLE_DONE");
+  } else {
+    Serial.println("ERROR: manual throttle seek timed out");
+    sendTcpLine("ERROR_MANUAL_THROTTLE_TIMEOUT");
+  }
+}
+
+// ----------------------------
+// TCP receive: converted sequence or command
+//
+// The whole sequence is read into sequence_buffer (safe on a Mega's 8KB
+// SRAM), then executed locally via closed-loop seeking -- see
+// executeSequence(). It is NOT forwarded to Motor for open-loop execution:
+// the CSV's own step counts assume a generic geometry, not this unit's real
+// calibrated span, so only commanded_throttle (converted through the real
+// calibration) can be trusted.
+// ----------------------------
+
+void checkForTcpSequence() {
+  EthernetClient new_client = server.available();
+
+  if (new_client) {
+    client = new_client;
+    Serial.println("TCP client connected / data available");
+  }
+
+  if (client && client.available() >= sizeof(uint16_t)) {
+    uint16_t to_read = 0;
+    client.read((uint8_t*)&to_read, sizeof(uint16_t));
+
+    if (to_read == TCP_PING_COMMAND) {
+      Serial.println("Ping received from GUI");
+      sendTcpLine("PONG");
+      return;
+    }
+
+    if (to_read == TCP_CALIBRATE_COMMAND) {
+      Serial.println("Calibration command received from GUI");
+      sendTcpLine("CALIBRATING");
+      bool ok = calibrateThrottle();
+      if (ok) sendTcpLine("CALIBRATION_DONE");
+      // On failure, the specific error line was already sent inside
+      // calibrateThrottle() -- deliberately NOT sending CALIBRATION_DONE
+      // here so the laptop can't mistake a failed run for success.
+      return;
+    }
+
+    if (to_read == TCP_MANUAL_THROTTLE_COMMAND) {
+      handleManualThrottleCommand();
+      return;
+    }
+
+    Serial.print("Incoming sequence bytes: ");
+    Serial.println(to_read);
+
+    if (to_read == 0) {
+      Serial.println("ERROR: zero-byte sequence");
+      sendTcpLine("ERROR_ZERO_BYTE_SEQUENCE");
+      client.stop();
+      return;
+    }
+
+    if (to_read > sequence_buffer_max) {
+      Serial.println("ERROR: sequence too large");
+      sendTcpLine("ERROR_SEQUENCE_TOO_LARGE");
+      client.stop();
+      return;
+    }
+
+    if (to_read % STEP_COMMAND_SIZE != 0) {
+      Serial.println("ERROR: bad converted sequence size");
+      sendTcpLine("ERROR_BAD_SEQUENCE_SIZE");
+      client.stop();
+      return;
+    }
+
+    // Sequences are meaningless without calibration -- there's no fallback
+    // interpretation of commanded_throttle without the real reference
+    // points, so refuse up front rather than guess.
+    if (!calibrated) {
+      Serial.println("ERROR: sequence requested before calibration completed");
+      sendTcpLine("ERROR_NOT_CALIBRATED");
+      client.stop();
+      return;
+    }
+
+    size_t total_read = 0;
+    unsigned long start_time = millis();
+    const unsigned long timeout_ms = 2000;
+
+    while (total_read < to_read) {
+      int got = client.read(sequence_buffer + total_read, to_read - total_read);
+      if (got > 0) {
+        total_read += got;
+        start_time = millis();
+      }
+      if (millis() - start_time > timeout_ms) {
+        Serial.println("ERROR: TCP read timeout mid-sequence");
+        sendTcpLine("ERROR_TCP_READ_TIMEOUT");
+        client.stop();
+        return;
+      }
+    }
+
+    Serial.print("Command count: ");
+    Serial.println(to_read / STEP_COMMAND_SIZE);
+
+    executeSequence(to_read / STEP_COMMAND_SIZE);
+  }
+}
+
+// ----------------------------
+// Execute a received sequence by closed-loop seeking to each waypoint's
+// commanded_throttle in turn. Positional accuracy takes priority over
+// exact timing: each row's duration_ms is NOT enforced as a deadline (the
+// seek runs until arrived or MANUAL_SEEK_TIMEOUT_MS elapses); its
+// interval_us IS honored as the stepping speed for that waypoint, to
+// approximate the profile's intended ramp rate. Motor is halted in place
+// (0 backoff) between waypoints.
+//
+// Known limitation: an ESTOP sent over UDP mid-sequence currently isn't
+// serviced until this function returns, since checkForUdpCommand() is
+// gated out of loop() while running_throttle_sequence is true (same as
+// calibration and manual seek already behave). Worth revisiting separately
+// if abort-mid-sequence is a real safety requirement.
+// ----------------------------
+
+void executeSequence(size_t command_count) {
+  running_throttle_sequence = true;
+  sendTcpLine("SEQUENCE_RECEIVED");
+
+  // Safety check: system must be ARMED before we'll start a sequence
+  if (!systemArmed) {
+    Serial.println("ERROR: sequence execution blocked - system DISARMED");
+    writeMotorFrame(CMD_ESTOP, nullptr, 0);
+    waitForMotorAck(ACK_ESTOPPED, 2000);
+    sendTcpLine("ERROR_SYSTEM_DISARMED");
+    running_throttle_sequence = false;
+    return;
+  }
+
+  // Motor hasn't been told anything yet -- nothing to discard if we abort here.
+  sendTcpLine("WAITING_FOR_START_PIN");
+  Serial.println("Sequence loaded, waiting for START_PIN to go HIGH...");
+
+  unsigned long waitStart = millis();
+  while (digitalRead(START_PIN) != HIGH) {
+    if (millis() - waitStart > START_PIN_TIMEOUT_MS) {
+      Serial.println("ERROR: timed out waiting for START_PIN, aborting sequence");
+      writeMotorFrame(CMD_ESTOP, nullptr, 0); // defensive: halt Motor regardless of state
+      waitForMotorAck(ACK_ESTOPPED, 2000);
+      sendTcpLine("ERROR_START_PIN_TIMEOUT");
+      running_throttle_sequence = false;
+      return;
+    }
+  }
+
+  sendTcpLine("SEQUENCE_RUNNING");
+  startLogging("SEQ");
+
+  bool errored = false;
+
+  for (size_t i = 0; i < command_count && !errored; i++) {
+    StepCommand cmd = getCommand(i);
+
+    float percent = cmd.commanded_throttle * 100.0f;
+    if (percent < CAL_STOP1_PERCENT) percent = CAL_STOP1_PERCENT;
+    if (percent > CAL_STOP2_PERCENT) percent = CAL_STOP2_PERCENT;
+    int16_t target_count = countFromThrottlePercent(percent);
+
+    uint32_t stepIntervalUs = (cmd.interval_us > 0) ? cmd.interval_us : CAL_INTERVAL_US;
+
+    Serial.print("Waypoint "); Serial.print(i);
+    Serial.print(": target "); Serial.print(percent, 2);
+    Serial.print("% (count "); Serial.print(target_count); Serial.println(")");
+
+    if (labs((long)target_count - (long)latestEncoderCount) <= MANUAL_SEEK_TOLERANCE_COUNTS) {
+      // Already there -- this is a hold step. Just wait out its duration.
+      delay(cmd.duration_ms);
+      continue;
+    }
+
+    bool arrived = seekToCount(target_count, stepIntervalUs, MANUAL_SEEK_TIMEOUT_MS);
+
+    // Halt in place before moving on to the next waypoint's direction/speed.
+    uint8_t stopPayload[4];
+    writeU32LE(stopPayload, 0);
+    writeMotorFrame(CMD_CAL_STOP, stopPayload, 4);
+    waitForMotorAck(ACK_CAL_DONE, 2000);
+
+    if (!arrived) {
+      Serial.print("ERROR: waypoint "); Serial.print(i); Serial.println(" unreachable, aborting sequence");
+      errored = true;
+    }
+  }
+
+  stopLogging();
+
+  if (errored) {
+    sendTcpLine("ERROR_SEQUENCE_WAYPOINT_UNREACHABLE");
+  } else {
+    sendTcpLine("SEQUENCE_DONE");
+  }
+
+  running_throttle_sequence = false;
+}
+
+// ----------------------------
+// UDP command receive
+// ----------------------------
+
+void checkForUdpCommand() {
+  udp.parsePacket();
+
+  if (udp.available() >= sizeof(UDPCommand)) {
+    UDPCommand command = UDPCommand::NONE;
+    udp.read((uint8_t*)&command, sizeof(UDPCommand));
+
+    switch (command) {
+      case UDPCommand::RECALIBRATE:
+        Serial.println("UDP recalibrate command received");
+        calibrateThrottle();
+        break;
+
+      case UDPCommand::ESTOP:
+        Serial.println("UDP ESTOP command received");
+        writeMotorFrame(CMD_ESTOP, nullptr, 0);
+        waitForMotorAck(ACK_ESTOPPED, 2000);
+        calibrating_throttle = false;
+        running_throttle_sequence = false;
+        break;
+
+      case UDPCommand::NONE:
+        break;
+    }
+  }
+}
+
+// ----------------------------
+// UDP telemetry send (periodic heartbeat; separate from the live per-sample
+// encoder forwarding that happens during a throttle sequence)
+//
+// 14-byte packet:
+//   [0]     'T' marker
+//   [1-4]   millis(), uint32 LE
+//   [5-6]   int16 LE -- throttle percent as centipercent (e.g. 8543 =
+//           85.43%) once calibrated; raw encoder count before that.
+//           See bit4 below to tell which.
+//   [7]     status flags: bit0=encoder seen, bit1=sequence running,
+//           bit2=calibrating, bit3=manual throttle seek in progress,
+//           bit4=calibrated (bytes 5-6 are centipercent, not a raw count),
+//           bit5=START_PIN currently HIGH (live arm/start-permission state)
+//   [8-9]   5V rail raw ADC reading, uint16 LE
+//   [10-11] 24V rail raw ADC reading, uint16 LE
+//   [12-13] 48V rail raw ADC reading, uint16 LE
+// ----------------------------
+
+void sendUdpTelemetry() {
+  static unsigned long last_udp_send = 0;
+  const unsigned long udp_interval_ms = 100;
+
+  if (millis() - last_udp_send < udp_interval_ms) return;
+  last_udp_send = millis();
+
+  uint16_t volt_5_raw  = analogRead(VOLTAGE_5_PIN);
+  uint16_t volt_24_raw = analogRead(VOLTAGE_24_PIN);
+  uint16_t volt_48_raw = analogRead(VOLTAGE_48_PIN);
+
+  uint8_t pkt[14];
+
+  pkt[0] = 'T'; // heartbeat/status marker, distinct from 'E' encoder samples
+
+  uint32_t t = millis();
+  pkt[1] = t & 0xFF; pkt[2] = (t >> 8) & 0xFF; pkt[3] = (t >> 16) & 0xFF; pkt[4] = (t >> 24) & 0xFF;
+
+  // Once calibrated, report throttle percent (as centipercent, e.g. 8543 =
+  // 85.43%) instead of the raw count -- see bit4 below for how to tell
+  // which one this packet is carrying.
+  int16_t encoderField = latestEncoderCount;
+  if (calibrated) {
+    float percent = throttlePercentFromCount(latestEncoderCount);
+    if (!isnan(percent)) encoderField = (int16_t)lround(percent * 100.0f);
+  }
+  pkt[5] = encoderField & 0xFF;
+  pkt[6] = (encoderField >> 8) & 0xFF;
+
+  uint8_t flags = 0;
+  if (encoderEverSeen) flags |= 0x01;
+  if (running_throttle_sequence) flags |= 0x02;
+  if (calibrating_throttle) flags |= 0x04;
+  if (manual_seek_active) flags |= 0x08;
+  if (calibrated) flags |= 0x10; // bytes 5-6 are centipercent, not a raw count
+  if (digitalRead(START_PIN) == HIGH) flags |= 0x20; // live external arm/start-permission pin state
+  pkt[7] = flags;
+
+  pkt[8]  = volt_5_raw & 0xFF;
+  pkt[9]  = (volt_5_raw >> 8) & 0xFF;
+  pkt[10] = volt_24_raw & 0xFF;
+  pkt[11] = (volt_24_raw >> 8) & 0xFF;
+  pkt[12] = volt_48_raw & 0xFF;
+  pkt[13] = (volt_48_raw >> 8) & 0xFF;
+
+  udp.beginPacket(remote_ip, remote_port);
+  udp.write(pkt, sizeof(pkt));
+  udp.endPacket();
+}
+

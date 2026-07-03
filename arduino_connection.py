@@ -3,11 +3,9 @@ import socket
 import struct
 import subprocess
 import sys
-
 from pathlib import Path
 
 import pyqtgraph as pg
-
 from PySide6.QtCore import QObject, QTimer, QElapsedTimer
 from PySide6.QtWidgets import (
     QLabel,
@@ -27,7 +25,6 @@ from PySide6.QtNetwork import QTcpSocket, QAbstractSocket
 TCP_PING_COMMAND = 0xFFFF
 TCP_CALIBRATE_COMMAND = 0xCA1B
 TCP_MANUAL_THROTTLE_COMMAND = 0x4D54  # 'MT'
-
 UDP_TELEMETRY_PORT = 7080
 
 # Voltage scaling.
@@ -52,7 +49,6 @@ class ArduinoConnection(QObject):
 
         self.window = window
         self.socket = QTcpSocket(self)
-
         self.sequence_buffer_capacity = 512
 
         self.ip_edit = window.findChild(QLineEdit, "IPEdit")
@@ -68,22 +64,18 @@ class ArduinoConnection(QObject):
 
         self.sequence_times_ms = []
         self.sequence_duration_ms = 0
-
         self.sequence_playhead_timer = QTimer(self)
         self.sequence_playhead_timer.timeout.connect(self.update_sequence_playhead)
-
         self.sequence_elapsed_timer = QElapsedTimer()
         self.sequence_playhead_running = False
 
         self.manual_throttle_slider = window.findChild(QSlider, "manualThrottleSlider")
         self.manual_throttle_text = window.findChild(QTextEdit, "manualThrottleText")
         self.throttle_set_button = window.findChild(QPushButton, "throttleSetButton")
-
         self.updating_manual_throttle_ui = False
         self.manual_throttle_percent = MANUAL_THROTTLE_MIN_PERCENT
 
         self.upload_sequence_button = window.findChild(QPushButton, "uploadSeqButton")
-
         self.sequence_graph_frame = window.findChild(QFrame, "sequenceGraphFrame")
 
         # Optional telemetry display widgets.
@@ -96,7 +88,21 @@ class ArduinoConnection(QObject):
         self.lcd_throttle_actual = window.findChild(QLCDNumber, "lcdThrottleActual")
         self.lcd_throttle_programmed = window.findChild(QLCDNumber, "lcdThrottleProgrammed")
 
-        self.latest_telemetry = None
+        # Error display widgets.
+        self.error_display = window.findChild(QTextEdit, "errorDisplay")
+        self.clear_error_button = window.findChild(QPushButton, "clearErrorButton")
+
+        # Arm indicator light.
+        self.arm_indicator = window.findChild(QLabel, "armIndicator")
+
+        # TCP status lines are newline terminated, but TCP can join or split
+        # messages. Keep a buffer so ARMED/DISARMED are parsed reliably.
+        self.tcp_rx_buffer = ""
+        self.system_armed = False
+
+        self.error_history = []
+        self.max_errors = 50
+
         self.telemetry_print_timer = QElapsedTimer()
         self.telemetry_print_timer.start()
 
@@ -113,6 +119,86 @@ class ArduinoConnection(QObject):
         self.status_label.setText(text)
         QApplication.processEvents()
         print(text)
+
+    def report_error(self, error_type, error_message, details=""):
+        """
+        Comprehensive error reporting function.
+
+        Args:
+            error_type: Type of error, e.g. CONNECTION, HARDWARE, DATA.
+            error_message: Brief error message.
+            details: Additional error details.
+        """
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        full_error = f"[{timestamp}] {error_type}: {error_message}"
+
+        if details:
+            full_error += f"\n Details: {details}"
+
+        self.error_history.append(full_error)
+
+        if len(self.error_history) > self.max_errors:
+            self.error_history.pop(0)
+
+        if self.error_display is not None:
+            self.error_display.setPlainText(full_error)
+
+        print(f"ERROR: {full_error}")
+        self.set_status(f"{error_type}: {error_message}")
+
+    def clear_errors(self):
+        self.error_history.clear()
+
+        if self.error_display is not None:
+            self.error_display.setPlainText("")
+
+        self.set_status("Errors cleared")
+
+    def get_error_history(self):
+        return self.error_history
+
+    def set_armed_indicator(self, is_armed):
+        """
+        Set the arm indicator light state.
+        Green = ARMED.
+        Red = DISARMED.
+        """
+        is_armed = bool(is_armed)
+        self.system_armed = is_armed
+
+        if self.arm_indicator is None:
+            return
+
+        if is_armed:
+            self.arm_indicator.setStyleSheet(
+                """
+                QLabel {
+                    background-color: #00ff00;
+                    border: 2px solid #008000;
+                    border-radius: 8px;
+                    color: black;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+                """
+            )
+            self.arm_indicator.setText("ARMED")
+        else:
+            self.arm_indicator.setStyleSheet(
+                """
+                QLabel {
+                    background-color: #ff0000;
+                    border: 2px solid #8b0000;
+                    border-radius: 8px;
+                    color: white;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+                """
+            )
+            self.arm_indicator.setText("DISARMED")
 
     def check_widgets_exist(self):
         missing = []
@@ -167,6 +253,9 @@ class ArduinoConnection(QObject):
         self.calibrate_button.setEnabled(False)
         self.sequence_name_label.setText("No Sequence Loaded")
 
+        # Safe default.
+        self.set_armed_indicator(False)
+
     def setup_socket(self):
         self.socket.connected.connect(self.on_connected)
         self.socket.disconnected.connect(self.on_disconnected)
@@ -180,6 +269,9 @@ class ArduinoConnection(QObject):
         self.select_sequence_button.clicked.connect(self.select_throttle_sequence)
         self.upload_sequence_button.clicked.connect(self.upload_throttle_sequence)
         self.throttle_set_button.clicked.connect(self.set_manual_throttle)
+
+        if self.clear_error_button is not None:
+            self.clear_error_button.clicked.connect(self.clear_errors)
 
     def setup_voltage_lcds(self):
         for lcd in (self.volt_5, self.volt_24, self.volt_48):
@@ -199,7 +291,6 @@ class ArduinoConnection(QObject):
             self.udp_timer.start(50)
 
             print(f"UDP telemetry listening on port {UDP_TELEMETRY_PORT}")
-
         except OSError as error:
             self.udp_socket = None
             self.udp_timer = None
@@ -231,20 +322,27 @@ class ArduinoConnection(QObject):
                 self.telemetry_print_timer.restart()
 
                 if telemetry["type"] == "telemetry":
+                    v5 = "n/a" if telemetry["volt_5"] is None else f"{telemetry['volt_5']:.2f}"
+                    v24 = "n/a" if telemetry["volt_24"] is None else f"{telemetry['volt_24']:.2f}"
+                    v48 = "n/a" if telemetry["volt_48"] is None else f"{telemetry['volt_48']:.2f}"
+
                     print(
                         "UDP telemetry: "
                         f"encoder={telemetry['encoder_count']}, "
-                        f"V5={telemetry['volt_5']:.2f}, "
-                        f"V24={telemetry['volt_24']:.2f}, "
-                        f"V48={telemetry['volt_48']:.2f}, "
+                        f"armed={telemetry['armed']}, "
+                        f"calibrated={telemetry['calibrated']}, "
+                        f"V5={v5}, "
+                        f"V24={v24}, "
+                        f"V48={v48}, "
                         f"raw=({telemetry['voltage1_raw']}, "
                         f"{telemetry['voltage2_raw']}, "
                         f"{telemetry['voltage3_raw']})"
                     )
                 elif telemetry["type"] == "encoder_sample":
+                    value_type = "percent" if telemetry.get("is_percent") else "count"
                     print(
                         "UDP encoder sample: "
-                        f"encoder={telemetry['encoder_count']}"
+                        f"encoder={telemetry['encoder_count']} ({value_type})"
                     )
 
     def parse_udp_packet(self, data):
@@ -253,45 +351,57 @@ class ArduinoConnection(QObject):
 
         packet_type = data[0:1]
 
-        # New 14-byte telemetry packet:
-        # Byte 0      = 'T'
-        # Bytes 1-4   = millis uint32
-        # Bytes 5-6   = encoder int16
-        # Byte 7      = flags
-        # Bytes 8-9   = voltage 1 raw uint16, mapped to volt_5
-        # Bytes 10-11 = voltage 2 raw uint16, mapped to volt_24
-        # Bytes 12-13 = voltage 3 raw uint16, mapped to volt_48
+        # Current Arduino 14-byte telemetry packet:
+        #
+        # Byte 0 = 'T'
+        # Bytes 1-4 = millis uint32
+        # Bytes 5-6 = int16: centipercent when calibrated, raw count otherwise
+        # Byte 7 = flags:
+        #   bit0 encoder seen
+        #   bit1 sequence running
+        #   bit2 calibrating
+        #   bit3 manual seek active
+        #   bit4 calibrated / encoder field is centipercent
+        #   bit5 START_PIN/ARM_PIN HIGH = armed
+        # Bytes 8-13 = three raw ADC readings
         if packet_type == b"T":
             if len(data) == 14:
                 time_ms = struct.unpack_from("<I", data, 1)[0]
-                encoder_count = struct.unpack_from("<h", data, 5)[0]
-
+                encoder_field = struct.unpack_from("<h", data, 5)[0]
                 flags = data[7]
+
                 encoder_seen = bool(flags & 0x01)
                 sequence_running = bool(flags & 0x02)
                 calibrating = bool(flags & 0x04)
+                manual_seek_active = bool(flags & 0x08)
+                calibrated = bool(flags & 0x10)
+                armed = bool(flags & 0x20)
 
                 voltage1_raw = struct.unpack_from("<H", data, 8)[0]
                 voltage2_raw = struct.unpack_from("<H", data, 10)[0]
                 voltage3_raw = struct.unpack_from("<H", data, 12)[0]
 
-                # Arduino analogue pin voltage, before external scaling.
                 voltage1_pin = voltage1_raw * 5.0 / 1023.0
                 voltage2_pin = voltage2_raw * 5.0 / 1023.0
                 voltage3_pin = voltage3_raw * 5.0 / 1023.0
 
-                # Real displayed voltages after applying scale factors.
                 volt_5_value = voltage1_pin * VOLT_5_SCALE
                 volt_24_value = voltage2_pin * VOLT_24_SCALE
                 volt_48_value = voltage3_pin * VOLT_48_SCALE
 
+                throttle_percent = encoder_field / 100.0 if calibrated else None
+
                 return {
                     "type": "telemetry",
                     "time_ms": time_ms,
-                    "encoder_count": encoder_count,
+                    "encoder_count": encoder_field,
                     "encoder_seen": encoder_seen,
                     "sequence_running": sequence_running,
                     "calibrating": calibrating,
+                    "manual_seek_active": manual_seek_active,
+                    "calibrated": calibrated,
+                    "armed": armed,
+                    "throttle_percent": throttle_percent,
                     "voltage1_raw": voltage1_raw,
                     "voltage2_raw": voltage2_raw,
                     "voltage3_raw": voltage3_raw,
@@ -303,7 +413,8 @@ class ArduinoConnection(QObject):
                     "volt_48": volt_48_value,
                 }
 
-            # Old 8-byte telemetry packet compatibility.
+            # Old 8-byte telemetry compatibility.
+            # This old packet does not include the arm bit, so fail safe to DISARMED.
             if len(data) == 8:
                 time_ms = struct.unpack_from("<I", data, 1)[0]
                 encoder_count = struct.unpack_from("<h", data, 5)[0]
@@ -316,6 +427,10 @@ class ArduinoConnection(QObject):
                     "encoder_seen": encoder_seen,
                     "sequence_running": False,
                     "calibrating": False,
+                    "manual_seek_active": False,
+                    "calibrated": False,
+                    "armed": False,
+                    "throttle_percent": None,
                     "voltage1_raw": None,
                     "voltage2_raw": None,
                     "voltage3_raw": None,
@@ -329,39 +444,54 @@ class ArduinoConnection(QObject):
 
             return None
 
-        # Encoder sample packet sent during sequences.
-        # Byte 0    = 'E'
+        # Encoder sample packet sent during sequences/manual seek:
+        #
+        # Byte 0 = 'E'
         # Bytes 1-4 = millis uint32
-        # Bytes 5-6 = encoder int16
-        if packet_type == b"E" and len(data) >= 7:
+        # Bytes 5-6 = int16 value
+        # Byte 7 = isPercent flag: 1 means value is centipercent
+        if packet_type == b"E" and len(data) >= 8:
             time_ms = struct.unpack_from("<I", data, 1)[0]
-            encoder_count = struct.unpack_from("<h", data, 5)[0]
+            encoder_field = struct.unpack_from("<h", data, 5)[0]
+            is_percent = bool(data[7])
 
             return {
                 "type": "encoder_sample",
                 "time_ms": time_ms,
-                "encoder_count": encoder_count,
+                "encoder_count": encoder_field,
+                "is_percent": is_percent,
+                "throttle_percent": encoder_field / 100.0 if is_percent else None,
             }
 
         return None
 
     def update_telemetry_display(self, telemetry):
+        # Use the live UDP arm bit from the Arduino.
+        # In the current Arduino packet, bit5 is START_PIN/ARM_PIN HIGH.
+        # Only True means ARMED. Missing/old packets fail safe to DISARMED.
+        if telemetry["type"] == "telemetry":
+            self.set_armed_indicator(telemetry.get("armed") is True)
+
         if "encoder_count" in telemetry and self.encoder_position_label is not None:
             self.encoder_position_label.setText(str(telemetry["encoder_count"]))
 
-        # Display encoder data on the LCD widget
-        if "encoder_count" in telemetry and self.lcd_throttle_actual is not None:
-            self.lcd_throttle_actual.display(telemetry["encoder_count"] / 100)
+        # Arduino sends centipercent only after calibration / when the E packet
+        # says isPercent. Display the real percent only when it is known.
+        throttle_percent = telemetry.get("throttle_percent")
+
+        if self.lcd_throttle_actual is not None:
+            if throttle_percent is not None:
+                self.lcd_throttle_actual.display(round(throttle_percent, 2))
+            else:
+                self.lcd_throttle_actual.display(0.0)
 
         if telemetry["type"] != "telemetry":
             return
 
         if telemetry["volt_5"] is not None and self.volt_5 is not None:
             self.volt_5.display(round(telemetry["volt_5"], 2))
-
         if telemetry["volt_24"] is not None and self.volt_24 is not None:
             self.volt_24.display(round(telemetry["volt_24"], 2))
-
         if telemetry["volt_48"] is not None and self.volt_48 is not None:
             self.volt_48.display(round(telemetry["volt_48"], 2))
 
@@ -392,7 +522,7 @@ class ArduinoConnection(QObject):
         throttle_percent = value / 10.0
         throttle_percent = max(
             MANUAL_THROTTLE_MIN_PERCENT,
-            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent)
+            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent),
         )
 
         self.manual_throttle_percent = throttle_percent
@@ -419,11 +549,10 @@ class ArduinoConnection(QObject):
 
         throttle_percent = max(
             MANUAL_THROTTLE_MIN_PERCENT,
-            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent)
+            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent),
         )
 
         self.manual_throttle_percent = throttle_percent
-
         slider_value = int(round(throttle_percent * 10.0))
 
         self.updating_manual_throttle_ui = True
@@ -438,19 +567,21 @@ class ArduinoConnection(QObject):
     def send_manual_throttle(self, throttle_percent):
         throttle_percent = max(
             MANUAL_THROTTLE_MIN_PERCENT,
-            min(MANUAL_THROTTLE_MAX_PERCENT, float(throttle_percent))
+            min(MANUAL_THROTTLE_MAX_PERCENT, float(throttle_percent)),
         )
 
         if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.set_status("Not connected")
-            print("Cannot send manual throttle: not connected")
+            self.report_error(
+                "CONNECTION",
+                "Cannot send throttle",
+                "Socket is not connected to Arduino",
+            )
             return
 
         self.socket.write(struct.pack("<H", TCP_MANUAL_THROTTLE_COMMAND))
         self.socket.write(struct.pack("<f", throttle_percent))
         self.socket.flush()
 
-        # Update the programmed throttle LCD display
         if self.lcd_throttle_programmed is not None:
             self.lcd_throttle_programmed.display(throttle_percent)
 
@@ -459,14 +590,11 @@ class ArduinoConnection(QObject):
 
     def setup_sequence_graph(self):
         self.sequence_plot = pg.PlotWidget()
-
         self.sequence_plot.setBackground("w")
         self.sequence_plot.showGrid(x=True, y=True)
-
         self.sequence_plot.setTitle("Throttle Sequence")
         self.sequence_plot.setLabel("bottom", "Time", units="ms")
         self.sequence_plot.setLabel("left", "Throttle", units="%")
-
         self.sequence_plot.setYRange(0, 100)
 
         self.sequence_curve = self.sequence_plot.plot(
@@ -483,7 +611,6 @@ class ArduinoConnection(QObject):
             movable=False,
             pen=pg.mkPen(width=2),
         )
-
         self.sequence_plot.addItem(self.sequence_playhead_line)
         self.sequence_playhead_line.setVisible(False)
 
@@ -513,26 +640,28 @@ class ArduinoConnection(QObject):
                     throttles_percent.append(throttle * 100.0)
 
             if not times_ms:
-                self.set_status("No valid graph data found")
+                self.report_error(
+                    "DATA",
+                    "No valid graph data",
+                    f"File '{filename}' contains no valid time/throttle pairs",
+                )
                 return
 
             self.sequence_curve.setData(times_ms, throttles_percent)
-
             self.sequence_times_ms = times_ms
             self.sequence_duration_ms = max(times_ms)
-
             self.sequence_playhead_line.setValue(min(times_ms))
             self.sequence_playhead_line.setVisible(True)
-
             self.sequence_plot.setYRange(0, 100)
 
             if min(times_ms) != max(times_ms):
                 self.sequence_plot.setXRange(min(times_ms), max(times_ms))
 
             self.set_status("Throttle sequence graphed")
-
+        except FileNotFoundError:
+            self.report_error("DATA", "Sequence file not found", filename)
         except Exception as error:
-            self.set_status("Graph update failed")
+            self.report_error("DATA", "Failed to update graph", str(error))
             print(f"Graph update failed: {error}")
 
     def start_sequence_playhead(self):
@@ -542,12 +671,9 @@ class ArduinoConnection(QObject):
 
         self.sequence_playhead_line.setVisible(True)
         self.sequence_playhead_line.setValue(0)
-
         self.sequence_elapsed_timer.restart()
         self.sequence_playhead_running = True
-
         self.sequence_playhead_timer.start(50)
-
         print("Sequence playhead started")
 
     def update_sequence_playhead(self):
@@ -555,7 +681,6 @@ class ArduinoConnection(QObject):
             return
 
         elapsed_ms = self.sequence_elapsed_timer.elapsed()
-
         self.sequence_playhead_line.setValue(elapsed_ms)
 
         if elapsed_ms >= self.sequence_duration_ms:
@@ -566,7 +691,6 @@ class ArduinoConnection(QObject):
     def stop_sequence_playhead(self):
         self.sequence_playhead_timer.stop()
         self.sequence_playhead_running = False
-
         print("Sequence playhead stopped")
 
     def get_ip_and_port(self):
@@ -576,11 +700,19 @@ class ArduinoConnection(QObject):
         try:
             port = int(port_text)
         except ValueError:
-            self.set_status("Invalid port")
+            self.report_error(
+                "VALIDATION",
+                "Invalid port number",
+                f"Port '{port_text}' is not a valid integer",
+            )
             return None, None
 
         if not 1 <= port <= 65535:
-            self.set_status("Port must be 1-65535")
+            self.report_error(
+                "VALIDATION",
+                "Port out of range",
+                f"Port must be 1-65535, got {port}",
+            )
             return None, None
 
         return ip, port
@@ -613,30 +745,33 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Cancel")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
-
         self.socket.abort()
         self.socket.connectToHost(ip, port)
 
     def ping_arduino(self):
         if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.set_status("Not connected")
-            print("Cannot ping: not connected")
+            self.report_error(
+                "CONNECTION",
+                "Cannot ping Arduino",
+                "Socket is not connected",
+            )
             return
 
         self.socket.write(struct.pack("<H", TCP_PING_COMMAND))
         self.socket.flush()
-
         self.set_status("Ping sent")
 
     def calibrate_arduino(self):
         if self.socket.state() != QAbstractSocket.ConnectedState:
-            self.set_status("Not connected")
-            print("Cannot calibrate: not connected")
+            self.report_error(
+                "CONNECTION",
+                "Cannot calibrate Arduino",
+                "Socket is not connected",
+            )
             return
 
         self.socket.write(struct.pack("<H", TCP_CALIBRATE_COMMAND))
         self.socket.flush()
-
         self.set_status("Calibration command sent")
         print("Calibration command sent")
 
@@ -649,6 +784,8 @@ class ArduinoConnection(QObject):
 
     def on_disconnected(self):
         self.stop_sequence_playhead()
+        self.tcp_rx_buffer = ""
+        self.set_armed_indicator(False)
         self.set_status("Disconnected")
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
@@ -658,10 +795,12 @@ class ArduinoConnection(QObject):
     def on_error(self, socket_error):
         error_text = self.socket.errorString()
         self.stop_sequence_playhead()
-        self.set_status(f"Error: {error_text}")
+        self.tcp_rx_buffer = ""
+        self.set_armed_indicator(False)
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.report_error("CONNECTION", "Socket error occurred", error_text)
         print(f"Socket error: {error_text}")
 
     def on_ready_read(self):
@@ -670,7 +809,47 @@ class ArduinoConnection(QObject):
         if not data:
             return
 
-        text = data.decode("utf-8", errors="replace").strip()
+        self.tcp_rx_buffer += data.decode("utf-8", errors="replace")
+
+        # Arduino TCP messages are newline terminated. TCP can join messages
+        # together, so process every complete line separately and keep any
+        # partial line in self.tcp_rx_buffer until the next readyRead.
+        while "\n" in self.tcp_rx_buffer:
+            line, self.tcp_rx_buffer = self.tcp_rx_buffer.split("\n", 1)
+            self.handle_tcp_line(line.strip())
+
+        # Defensive fallback: if a whole message arrives without a newline,
+        # still handle the known short status tokens.
+        token = self.tcp_rx_buffer.strip()
+
+        if token in (
+            "ARMED",
+            "DISARMED",
+            "PONG",
+            "CALIBRATING",
+            "CALIBRATION_DONE",
+            "MANUAL_THROTTLE_DONE",
+        ):
+            self.tcp_rx_buffer = ""
+            self.handle_tcp_line(token)
+
+    def handle_tcp_line(self, text):
+        if not text:
+            return
+
+        # Exact ARMED -> armed.
+        # Exact DISARMED -> disarmed.
+        # Other status strings do not make the system armed.
+        # The live UDP bit also continuously updates the indicator.
+        if text == "ARMED":
+            self.set_armed_indicator(True)
+            self.set_status("System ARMED")
+            return
+
+        if text == "DISARMED":
+            self.set_armed_indicator(False)
+            self.set_status("System DISARMED")
+            return
 
         if text == "PONG":
             self.set_status("Arduino replied: PONG")
@@ -681,19 +860,43 @@ class ArduinoConnection(QObject):
         elif text == "CALIBRATION_DONE":
             self.set_status("Calibration complete")
             print("Calibration complete")
+        elif text == "MANUAL_THROTTLE_DONE":
+            self.set_status("Manual throttle complete")
+            print("Manual throttle complete")
         elif text == "MANUAL_THROTTLE_SENT":
+            # Backwards compatibility with older Arduino code.
             self.set_status("Arduino accepted manual throttle")
             print("Arduino accepted manual throttle")
+        elif text == "SEQUENCE_RECEIVED":
+            self.set_status("Sequence received by Arduino")
+        elif text == "WAITING_FOR_START_PIN":
+            self.set_status("Waiting for arm/start pin")
+        elif text == "WAITING_FOR_ARM_PIN":
+            # Backwards compatibility with older Arduino code.
+            self.set_status("Waiting for arm/start pin")
+        elif text == "SEQUENCE_RUNNING":
+            self.set_status("Sequence running")
+            self.start_sequence_playhead()
+        elif text == "SEQUENCE_DONE":
+            self.stop_sequence_playhead()
+            self.set_status("Sequence complete")
+        elif text.startswith("ERROR_"):
+            self.stop_sequence_playhead()
+            self.report_error(
+                "ARDUINO",
+                text,
+                "Arduino reported an error over TCP",
+            )
         else:
             self.set_status(f"Arduino: {text}")
-            print(f"Arduino TCP data: {data}")
+            print(f"Arduino TCP line: {text}")
 
     def select_throttle_sequence(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self.window,
             "Select Throttle Sequence",
             "",
-            "CSV Files (*.csv);;All Files (*)"
+            "CSV Files (*.csv);;All Files (*)",
         )
 
         if not file_path:
@@ -702,12 +905,9 @@ class ArduinoConnection(QObject):
 
         self.selected_sequence_file = file_path
         file_name = Path(file_path).name
-
         self.sequence_name_label.setText(file_name)
-
         self.set_status("Throttle sequence selected")
         print(f"Selected throttle sequence: {file_path}")
-
         self.update_sequence_graph(file_path)
 
     def upload_throttle_sequence(self):
@@ -719,8 +919,11 @@ class ArduinoConnection(QObject):
             self.set_status("Not connected")
             return
 
-        project_dir = Path(__file__).parent
+        if not self.system_armed:
+            self.report_error("VALIDATION", "Cannot upload sequence", "System is DISARMED - arm the system first")
+            return
 
+        project_dir = Path(__file__).parent
         selected_file = Path(self.selected_sequence_file)
         convert_script = project_dir / "convert_throttle.py"
         converted_file = project_dir / "converted_sequence.csv"
@@ -737,7 +940,6 @@ class ArduinoConnection(QObject):
 
         try:
             self.upload_sequence_button.setEnabled(False)
-
             self.set_status("Preparing sequence...")
             print(f"Selected sequence: {selected_file}")
 
@@ -766,9 +968,7 @@ class ArduinoConnection(QObject):
                 return
 
             self.set_status("Sequence converted")
-
             self.set_status("Sending sequence...")
-
             result = self.send_converted_sequence_csv(converted_file)
 
             self.set_status(
@@ -776,29 +976,31 @@ class ArduinoConnection(QObject):
                 f"{result['payload_size']} bytes"
             )
 
-            self.start_sequence_playhead()
-
+            # Do not start the playhead here.
+            # The latest Arduino waits for START_PIN/ARM_PIN before moving
+            # and sends SEQUENCE_RUNNING when motion actually begins.
+            # handle_tcp_line() starts the playhead then.
         except subprocess.CalledProcessError as error:
             self.stop_sequence_playhead()
-            self.set_status("Upload failed")
-
-            print("Upload failed")
-            print(f"Command: {error.cmd}")
-            print(f"Return code: {error.returncode}")
+            error_details = f"Return code: {error.returncode}\nCommand: {error.cmd}"
 
             if error.stdout:
-                print("STDOUT:")
-                print(error.stdout)
-
+                error_details += f"\nSTDOUT: {error.stdout}"
             if error.stderr:
-                print("STDERR:")
-                print(error.stderr)
+                error_details += f"\nSTDERR: {error.stderr}"
 
+            self.report_error(
+                "CONVERSION",
+                "Throttle sequence conversion failed",
+                error_details,
+            )
         except Exception as error:
             self.stop_sequence_playhead()
-            self.set_status("Upload failed")
-            print(f"Upload failed: {error}")
-
+            self.report_error(
+                "HARDWARE",
+                "Failed to upload throttle sequence",
+                str(error),
+            )
         finally:
             self.upload_sequence_button.setEnabled(True)
 
@@ -822,23 +1024,22 @@ class ArduinoConnection(QObject):
 
                 if direction not in (0, 1):
                     raise RuntimeError(f"Invalid direction value: {direction}")
-
                 if duration_ms < 0:
                     raise RuntimeError(f"Invalid duration_ms: {duration_ms}")
-
                 if steps < 0:
                     raise RuntimeError(f"Invalid steps: {steps}")
-
                 if interval_us < 0:
                     raise RuntimeError(f"Invalid interval_us: {interval_us}")
 
-                commands.append({
-                    "duration_ms": duration_ms,
-                    "steps": steps,
-                    "direction": direction,
-                    "interval_us": interval_us,
-                    "commanded_throttle": commanded_throttle,
-                })
+                commands.append(
+                    {
+                        "duration_ms": duration_ms,
+                        "steps": steps,
+                        "direction": direction,
+                        "interval_us": interval_us,
+                        "commanded_throttle": commanded_throttle,
+                    }
+                )
 
         return commands
 
@@ -876,7 +1077,6 @@ class ArduinoConnection(QObject):
             )
 
         size_header = struct.pack("<H", len(payload))
-
         self.socket.write(size_header)
         self.socket.write(payload)
         self.socket.flush()

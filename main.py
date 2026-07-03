@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QIODevice, QObject, Signal
+from PySide6.QtCore import QFile, QIODevice, QObject, Signal, Qt
 from PySide6.QtGui import QAction, QTextCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -121,6 +121,40 @@ def apply_light_theme(app):
             color: black;
         }
     """)
+
+
+class FloatingErrorWindow(QDialog):
+    """Floating window for error display that syncs with main window"""
+    def __init__(self, error_display, clear_callback, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Error Log")
+        self.setGeometry(100, 100, 400, 300)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        
+        # Create floating error display
+        self.floating_error_display = QTextEdit()
+        self.floating_error_display.setReadOnly(True)
+        self.floating_error_display.setStyleSheet(error_display.styleSheet())
+        
+        # Sync text from main window
+        self.floating_error_display.setPlainText(error_display.toPlainText())
+        
+        # Create clear button
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.clicked.connect(clear_callback)
+        
+        # Setup layout
+        layout = QVBoxLayout()
+        layout.addWidget(self.floating_error_display)
+        layout.addWidget(self.clear_button)
+        self.setLayout(layout)
+        
+        # Store reference to main error display for syncing
+        self.main_error_display = error_display
+    
+    def update_display(self, text):
+        """Update the floating window with new error text"""
+        self.floating_error_display.setPlainText(text)
 
 
 class TerminalWindow(QDialog):
@@ -324,13 +358,50 @@ def main():
     sys.stdout = stdout_redirector
     sys.stderr = stderr_redirector
 
+    # Setup floating error window system
+    error_display = window.findChild(QTextEdit, "errorDisplay")
+    pop_out_button = window.findChild(QPushButton, "popOutErrorButton")
+    
+    floating_error_window = [None]  # Use list to allow modification in nested function
+    
+    # Create ArduinoConnection first so we can reference it
     arduino = ArduinoConnection(window)
+    
+    # Sync error display updates to floating window
+    def sync_floating_display():
+        if floating_error_window[0] is not None and floating_error_window[0].isVisible():
+            floating_error_window[0].update_display(error_display.toPlainText())
+    
+    # Wrapper for clear_errors that also syncs floating window
+    def clear_errors_with_sync():
+        arduino.clear_errors()
+        sync_floating_display()
+    
+    def show_floating_error():
+        if floating_error_window[0] is None or not floating_error_window[0].isVisible():
+            floating_error_window[0] = FloatingErrorWindow(error_display, clear_errors_with_sync, window)
+            floating_error_window[0].show()
+        else:
+            floating_error_window[0].raise_()
+            floating_error_window[0].activateWindow()
+    
+    if pop_out_button:
+        pop_out_button.clicked.connect(show_floating_error)
+    
+    # Patch the ArduinoConnection to sync floating window on error updates
+    original_report_error = arduino.report_error
+    def report_error_with_sync(*args, **kwargs):
+        original_report_error(*args, **kwargs)
+        sync_floating_display()
+    arduino.report_error = report_error_with_sync
 
     # Keep references alive so Qt does not garbage collect them.
     window.arduino_connection = arduino
     window.menu_actions = menu_actions
     window.stdout_redirector = stdout_redirector
     window.stderr_redirector = stderr_redirector
+    window.floating_error_window = floating_error_window
+    window.sync_floating_display = sync_floating_display
 
     window.show()
 
