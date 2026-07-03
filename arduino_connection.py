@@ -38,6 +38,13 @@ VOLT_5_SCALE = 1.0
 VOLT_24_SCALE = 1.0
 VOLT_48_SCALE = 1.0
 
+# Manual throttle safety limits.
+# Slider uses tenths of a percent, so:
+# 20.0% = 200
+# 100.0% = 1000
+MANUAL_THROTTLE_MIN_PERCENT = 20.0
+MANUAL_THROTTLE_MAX_PERCENT = 100.0
+
 
 class ArduinoConnection(QObject):
     def __init__(self, window):
@@ -73,7 +80,7 @@ class ArduinoConnection(QObject):
         self.throttle_set_button = window.findChild(QPushButton, "throttleSetButton")
 
         self.updating_manual_throttle_ui = False
-        self.manual_throttle_percent = 0.0
+        self.manual_throttle_percent = MANUAL_THROTTLE_MIN_PERCENT
 
         self.upload_sequence_button = window.findChild(QPushButton, "uploadSeqButton")
 
@@ -86,6 +93,7 @@ class ArduinoConnection(QObject):
         self.volt_5 = window.findChild(QLCDNumber, "volt_5")
         self.volt_24 = window.findChild(QLCDNumber, "volt_24")
         self.volt_48 = window.findChild(QLCDNumber, "volt_48")
+        self.lcd_throttle_actual = window.findChild(QLCDNumber, "lcdThrottleActual")
 
         self.latest_telemetry = None
         self.telemetry_print_timer = QElapsedTimer()
@@ -340,6 +348,10 @@ class ArduinoConnection(QObject):
         if "encoder_count" in telemetry and self.encoder_position_label is not None:
             self.encoder_position_label.setText(str(telemetry["encoder_count"]))
 
+        # Display encoder data on the LCD widget
+        if "encoder_count" in telemetry and self.lcd_throttle_actual is not None:
+            self.lcd_throttle_actual.display(telemetry["encoder_count"])
+
         if telemetry["type"] != "telemetry":
             return
 
@@ -353,13 +365,16 @@ class ArduinoConnection(QObject):
             self.volt_48.display(round(telemetry["volt_48"], 2))
 
     def setup_manual_throttle_controls(self):
-        self.manual_throttle_slider.setMinimum(0)
-        self.manual_throttle_slider.setMaximum(1000)
+        slider_min = int(round(MANUAL_THROTTLE_MIN_PERCENT * 10.0))
+        slider_max = int(round(MANUAL_THROTTLE_MAX_PERCENT * 10.0))
+
+        self.manual_throttle_slider.setMinimum(slider_min)
+        self.manual_throttle_slider.setMaximum(slider_max)
 
         self.updating_manual_throttle_ui = True
-        self.manual_throttle_slider.setValue(0)
-        self.manual_throttle_text.setPlainText("0.0")
-        self.manual_throttle_percent = 0.0
+        self.manual_throttle_slider.setValue(slider_min)
+        self.manual_throttle_text.setPlainText(f"{MANUAL_THROTTLE_MIN_PERCENT:.1f}")
+        self.manual_throttle_percent = MANUAL_THROTTLE_MIN_PERCENT
         self.updating_manual_throttle_ui = False
 
         self.manual_throttle_slider.valueChanged.connect(
@@ -374,6 +389,11 @@ class ArduinoConnection(QObject):
             return
 
         throttle_percent = value / 10.0
+        throttle_percent = max(
+            MANUAL_THROTTLE_MIN_PERCENT,
+            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent)
+        )
+
         self.manual_throttle_percent = throttle_percent
 
         self.updating_manual_throttle_ui = True
@@ -396,7 +416,11 @@ class ArduinoConnection(QObject):
         except ValueError:
             return
 
-        throttle_percent = max(0.0, min(100.0, throttle_percent))
+        throttle_percent = max(
+            MANUAL_THROTTLE_MIN_PERCENT,
+            min(MANUAL_THROTTLE_MAX_PERCENT, throttle_percent)
+        )
+
         self.manual_throttle_percent = throttle_percent
 
         slider_value = int(round(throttle_percent * 10.0))
@@ -411,7 +435,10 @@ class ArduinoConnection(QObject):
         self.send_manual_throttle(self.manual_throttle_percent)
 
     def send_manual_throttle(self, throttle_percent):
-        throttle_percent = max(0.0, min(100.0, float(throttle_percent)))
+        throttle_percent = max(
+            MANUAL_THROTTLE_MIN_PERCENT,
+            min(MANUAL_THROTTLE_MAX_PERCENT, float(throttle_percent))
+        )
 
         if self.socket.state() != QAbstractSocket.ConnectedState:
             self.set_status("Not connected")
