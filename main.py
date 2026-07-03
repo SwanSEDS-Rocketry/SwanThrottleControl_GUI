@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from arduino_connection import ArduinoConnection
 
 
-APP_TITLE = "SwanSEDS | Kilgharrah Throttle Control Software v0.1.1"
+APP_TITLE = "SwanSEDS | Kilgharrah Throttle Control Software v0.2.1"
 
 
 def load_ui_file(file_name, parent=None):

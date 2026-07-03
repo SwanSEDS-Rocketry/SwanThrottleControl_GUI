@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QVBoxLayout,
     QFrame,
+    QTextEdit,
+    QSlider,
 )
 from PySide6.QtNetwork import QTcpSocket, QAbstractSocket
 
@@ -49,6 +51,13 @@ class ArduinoConnection(QObject):
         self.sequence_elapsed_timer = QElapsedTimer()
         self.sequence_playhead_running = False
 
+        self.manual_throttle_slider = window.findChild(QSlider, "manualThrottleSlider")
+        self.manual_throttle_text = window.findChild(QTextEdit, "manualThrottleText")
+        self.throttle_set_button = window.findChild(QPushButton, "throttleSetButton")
+
+        self.updating_manual_throttle_ui = False
+        self.manual_throttle_percent = 0.0
+
         self.upload_sequence_button = window.findChild(QPushButton, "uploadSeqButton")
 
         self.sequence_graph_frame = window.findChild(QFrame, "sequenceGraphFrame")
@@ -58,6 +67,7 @@ class ArduinoConnection(QObject):
         self.setup_socket()
         self.setup_buttons()
         self.setup_sequence_graph()
+        self.setup_manual_throttle_controls()
 
     def set_status(self, text):
         self.status_label.setText(text)
@@ -87,6 +97,12 @@ class ArduinoConnection(QObject):
             missing.append("uploadSeqButton")
         if self.sequence_graph_frame is None:
             missing.append("sequenceGraphFrame")
+        if self.manual_throttle_slider is None:
+            missing.append("manualThrottleSlider")
+        if self.manual_throttle_text is None:
+            missing.append("manualThrottleText")
+        if self.throttle_set_button is None:
+            missing.append("throttleSetButton")
 
         if missing:
             raise RuntimeError(
@@ -114,6 +130,82 @@ class ArduinoConnection(QObject):
         self.calibrate_button.clicked.connect(self.calibrate_arduino)
         self.select_sequence_button.clicked.connect(self.select_throttle_sequence)
         self.upload_sequence_button.clicked.connect(self.upload_throttle_sequence)
+        self.throttle_set_button.clicked.connect(self.set_manual_throttle)
+
+    def setup_manual_throttle_controls(self):
+        self.manual_throttle_slider.setMinimum(0)
+        self.manual_throttle_slider.setMaximum(1000)
+
+        self.updating_manual_throttle_ui = True
+        self.manual_throttle_slider.setValue(0)
+        self.manual_throttle_text.setPlainText("0.0")
+        self.manual_throttle_percent = 0.0
+        self.updating_manual_throttle_ui = False
+
+        self.manual_throttle_slider.valueChanged.connect(
+            self.manual_throttle_slider_changed
+        )
+        self.manual_throttle_text.textChanged.connect(
+            self.manual_throttle_text_changed
+        )
+
+    def manual_throttle_slider_changed(self, value):
+        if self.updating_manual_throttle_ui:
+            return
+
+        throttle_percent = value / 10.0
+        self.manual_throttle_percent = throttle_percent
+
+        self.updating_manual_throttle_ui = True
+        self.manual_throttle_text.setPlainText(f"{throttle_percent:.1f}")
+        self.updating_manual_throttle_ui = False
+
+        self.set_status(f"Manual throttle target: {throttle_percent:.1f}%")
+
+    def manual_throttle_text_changed(self):
+        if self.updating_manual_throttle_ui:
+            return
+
+        text = self.manual_throttle_text.toPlainText().strip()
+
+        if text.endswith("%"):
+            text = text[:-1].strip()
+
+        try:
+            throttle_percent = float(text)
+        except ValueError:
+            return
+
+        throttle_percent = max(0.0, min(100.0, throttle_percent))
+        self.manual_throttle_percent = throttle_percent
+
+        slider_value = int(round(throttle_percent * 10.0))
+
+        self.updating_manual_throttle_ui = True
+        self.manual_throttle_slider.setValue(slider_value)
+        self.updating_manual_throttle_ui = False
+
+        self.set_status(f"Manual throttle target: {throttle_percent:.1f}%")
+
+    def set_manual_throttle(self):
+        self.send_manual_throttle(self.manual_throttle_percent)
+
+    def send_manual_throttle(self, throttle_percent):
+        throttle_percent = max(0.0, min(100.0, float(throttle_percent)))
+
+        if self.socket.state() != QAbstractSocket.ConnectedState:
+            self.set_status("Not connected")
+            print("Cannot send manual throttle: not connected")
+            return
+
+        TCP_MANUAL_THROTTLE_COMMAND = 0x4D54  # 'MT'
+
+        self.socket.write(struct.pack("<H", TCP_MANUAL_THROTTLE_COMMAND))
+        self.socket.write(struct.pack("<f", throttle_percent))
+        self.socket.flush()
+
+        self.set_status(f"Manual throttle sent: {throttle_percent:.1f}%")
+        print(f"Manual throttle sent: {throttle_percent:.1f}%")
 
     def setup_sequence_graph(self):
         self.sequence_plot = pg.PlotWidget()
@@ -340,6 +432,9 @@ class ArduinoConnection(QObject):
         elif text == "CALIBRATION_DONE":
             self.set_status("Calibration complete")
             print("Calibration complete")
+        elif text == "MANUAL_THROTTLE_SENT":
+            self.set_status("Arduino accepted manual throttle")
+            print("Arduino accepted manual throttle")
         else:
             self.set_status(f"Arduino: {text}")
             print(f"Arduino TCP data: {data}")
