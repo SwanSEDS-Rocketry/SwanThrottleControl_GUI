@@ -94,6 +94,7 @@ class ArduinoConnection(QObject):
         self.volt_24 = window.findChild(QLCDNumber, "volt_24")
         self.volt_48 = window.findChild(QLCDNumber, "volt_48")
         self.lcd_throttle_actual = window.findChild(QLCDNumber, "lcdThrottleActual")
+        self.lcd_throttle_programmed = window.findChild(QLCDNumber, "lcdThrottleProgrammed")
 
         self.latest_telemetry = None
         self.telemetry_print_timer = QElapsedTimer()
@@ -448,6 +449,10 @@ class ArduinoConnection(QObject):
         self.socket.write(struct.pack("<H", TCP_MANUAL_THROTTLE_COMMAND))
         self.socket.write(struct.pack("<f", throttle_percent))
         self.socket.flush()
+
+        # Update the programmed throttle LCD display
+        if self.lcd_throttle_programmed is not None:
+            self.lcd_throttle_programmed.display(throttle_percent)
 
         self.set_status(f"Manual throttle sent: {throttle_percent:.1f}%")
         print(f"Manual throttle sent: {throttle_percent:.1f}%")

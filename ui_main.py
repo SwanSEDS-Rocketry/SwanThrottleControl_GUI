@@ -150,11 +150,11 @@ class Ui_MainWindow(object):
 
         self.gridLayout.addWidget(self.lcdThrottleActual, 1, 1, 1, 1)
 
-        self.lcdNumber_4 = QLCDNumber(self.gridLayoutWidget)
-        self.lcdNumber_4.setObjectName(u"lcdNumber_4")
-        self.lcdNumber_4.setLineWidth(1)
+        self.lcdThrottleProgrammed = QLCDNumber(self.gridLayoutWidget)
+        self.lcdThrottleProgrammed.setObjectName(u"lcdThrottleProgrammed")
+        self.lcdThrottleProgrammed.setLineWidth(1)
 
-        self.gridLayout.addWidget(self.lcdNumber_4, 0, 1, 1, 1)
+        self.gridLayout.addWidget(self.lcdThrottleProgrammed, 0, 1, 1, 1)
 
         self.sequenceGraphFrame = QFrame(self.groupBox)
         self.sequenceGraphFrame.setObjectName(u"sequenceGraphFrame")
@@ -283,23 +283,6 @@ class Ui_MainWindow(object):
         self.calibrateButton = QPushButton(self.groupBox_4)
         self.calibrateButton.setObjectName(u"calibrateButton")
         self.calibrateButton.setGeometry(QRect(10, 40, 131, 29))
-        self.horizontalLayoutWidget_5 = QWidget(self.groupBox_4)
-        self.horizontalLayoutWidget_5.setObjectName(u"horizontalLayoutWidget_5")
-        self.horizontalLayoutWidget_5.setGeometry(QRect(130, 40, 160, 31))
-        self.horizontalLayout_7 = QHBoxLayout(self.horizontalLayoutWidget_5)
-        self.horizontalLayout_7.setObjectName(u"horizontalLayout_7")
-        self.horizontalLayout_7.setContentsMargins(0, 0, 0, 0)
-        self.label_8 = QLabel(self.horizontalLayoutWidget_5)
-        self.label_8.setObjectName(u"label_8")
-        self.label_8.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignTrailing|Qt.AlignmentFlag.AlignVCenter)
-
-        self.horizontalLayout_7.addWidget(self.label_8)
-
-        self.calibrationLabel = QLabel(self.horizontalLayoutWidget_5)
-        self.calibrationLabel.setObjectName(u"calibrationLabel")
-
-        self.horizontalLayout_7.addWidget(self.calibrationLabel)
-
         self.groupBox_5 = QGroupBox(self.centralwidget)
         self.groupBox_5.setObjectName(u"groupBox_5")
         self.groupBox_5.setGeometry(QRect(430, 360, 251, 191))
@@ -446,8 +429,6 @@ class Ui_MainWindow(object):
         self.PingButton.setText(QCoreApplication.translate("MainWindow", u"Ping", None))
         self.groupBox_4.setTitle(QCoreApplication.translate("MainWindow", u"Calibration", None))
         self.calibrateButton.setText(QCoreApplication.translate("MainWindow", u"Start Calibration", None))
-        self.label_8.setText(QCoreApplication.translate("MainWindow", u"Status:", None))
-        self.calibrationLabel.setText(QCoreApplication.translate("MainWindow", u"TextLabel", None))
         self.groupBox_5.setTitle(QCoreApplication.translate("MainWindow", u"Manual Throttle", None))
         self.throttleSetButton.setText(QCoreApplication.translate("MainWindow", u"Override", None))
         self.label_6.setText(QCoreApplication.translate("MainWindow", u"Throttle %", None))
