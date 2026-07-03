@@ -350,7 +350,7 @@ class ArduinoConnection(QObject):
 
         # Display encoder data on the LCD widget
         if "encoder_count" in telemetry and self.lcd_throttle_actual is not None:
-            self.lcd_throttle_actual.display(telemetry["encoder_count"])
+            self.lcd_throttle_actual.display(telemetry["encoder_count"] / 100)
 
         if telemetry["type"] != "telemetry":
             return

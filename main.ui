@@ -141,7 +141,7 @@
      <property name="geometry">
       <rect>
        <x>530</x>
-       <y>250</y>
+       <y>260</y>
        <width>300</width>
        <height>63</height>
       </rect>
@@ -308,7 +308,7 @@
          </font>
         </property>
         <property name="text">
-         <string>Version 0.2.2</string>
+         <string>Version 0.2.3</string>
         </property>
         <property name="alignment">
          <set>Qt::AlignmentFlag::AlignCenter</set>
