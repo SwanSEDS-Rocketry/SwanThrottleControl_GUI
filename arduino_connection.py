@@ -25,6 +25,7 @@ from PySide6.QtNetwork import QTcpSocket, QAbstractSocket
 TCP_PING_COMMAND = 0xFFFF
 TCP_CALIBRATE_COMMAND = 0xCA1B
 TCP_MANUAL_THROTTLE_COMMAND = 0x4D54  # 'MT'
+TCP_RESET_COMMAND = 0x5253  # 'RS'
 UDP_TELEMETRY_PORT = 7080
 
 # Voltage scaling.
@@ -56,6 +57,11 @@ class ArduinoConnection(QObject):
         self.connect_button = window.findChild(QPushButton, "connectButton")
         self.ping_button = window.findChild(QPushButton, "PingButton")
         self.calibrate_button = window.findChild(QPushButton, "calibrateButton")
+
+        # Optional reset button.
+        # If this does not exist in Qt Designer yet, the GUI will still load.
+        self.reset_arduino_button = window.findChild(QPushButton, "resetArduinoButton")
+
         self.status_label = window.findChild(QLabel, "ConnectionLabel")
 
         self.select_sequence_button = window.findChild(QPushButton, "selectSequenceButton")
@@ -116,7 +122,8 @@ class ArduinoConnection(QObject):
         self.setup_udp_telemetry()
 
     def set_status(self, text):
-        self.status_label.setText(text)
+        if self.status_label is not None:
+            self.status_label.setText(text)
         QApplication.processEvents()
         print(text)
 
@@ -200,6 +207,10 @@ class ArduinoConnection(QObject):
             )
             self.arm_indicator.setText("DISARMED")
 
+    def set_reset_button_enabled(self, enabled):
+        if self.reset_arduino_button is not None:
+            self.reset_arduino_button.setEnabled(enabled)
+
     def check_widgets_exist(self):
         missing = []
 
@@ -230,14 +241,21 @@ class ArduinoConnection(QObject):
         if self.throttle_set_button is None:
             missing.append("throttleSetButton")
 
-        # These are optional for now so the app does not crash if the names
-        # are slightly different in Qt Designer.
+        # Optional widgets.
+        if self.reset_arduino_button is None:
+            print("Warning: Could not find QPushButton resetArduinoButton")
         if self.volt_5 is None:
             print("Warning: Could not find QLCDNumber volt_5")
         if self.volt_24 is None:
             print("Warning: Could not find QLCDNumber volt_24")
         if self.volt_48 is None:
             print("Warning: Could not find QLCDNumber volt_48")
+        if self.lcd_throttle_actual is None:
+            print("Warning: Could not find QLCDNumber lcdThrottleActual")
+        if self.lcd_throttle_programmed is None:
+            print("Warning: Could not find QLCDNumber lcdThrottleProgrammed")
+        if self.arm_indicator is None:
+            print("Warning: Could not find QLabel armIndicator")
 
         if missing:
             raise RuntimeError(
@@ -251,6 +269,7 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.set_reset_button_enabled(False)
         self.sequence_name_label.setText("No Sequence Loaded")
 
         # Safe default.
@@ -269,6 +288,9 @@ class ArduinoConnection(QObject):
         self.select_sequence_button.clicked.connect(self.select_throttle_sequence)
         self.upload_sequence_button.clicked.connect(self.upload_throttle_sequence)
         self.throttle_set_button.clicked.connect(self.set_manual_throttle)
+
+        if self.reset_arduino_button is not None:
+            self.reset_arduino_button.clicked.connect(self.reset_arduino)
 
         if self.clear_error_button is not None:
             self.clear_error_button.clicked.connect(self.clear_errors)
@@ -734,6 +756,7 @@ class ArduinoConnection(QObject):
             self.connect_button.setText("Connect")
             self.ping_button.setEnabled(False)
             self.calibrate_button.setEnabled(False)
+            self.set_reset_button_enabled(False)
             return
 
         ip, port = self.get_ip_and_port()
@@ -745,6 +768,7 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Cancel")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.set_reset_button_enabled(False)
         self.socket.abort()
         self.socket.connectToHost(ip, port)
 
@@ -760,6 +784,20 @@ class ArduinoConnection(QObject):
         self.socket.write(struct.pack("<H", TCP_PING_COMMAND))
         self.socket.flush()
         self.set_status("Ping sent")
+
+    def reset_arduino(self):
+        if self.socket.state() != QAbstractSocket.ConnectedState:
+            self.report_error(
+                "CONNECTION",
+                "Cannot reset Arduino",
+                "Socket is not connected",
+            )
+            return
+
+        self.socket.write(struct.pack("<H", TCP_RESET_COMMAND))
+        self.socket.flush()
+        self.set_status("Reset command sent")
+        print("Reset command sent")
 
     def calibrate_arduino(self):
         if self.socket.state() != QAbstractSocket.ConnectedState:
@@ -780,6 +818,7 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Disconnect")
         self.ping_button.setEnabled(True)
         self.calibrate_button.setEnabled(True)
+        self.set_reset_button_enabled(True)
         print("Connected to Arduino")
 
     def on_disconnected(self):
@@ -790,6 +829,7 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.set_reset_button_enabled(False)
         print("Disconnected from Arduino")
 
     def on_error(self, socket_error):
@@ -800,6 +840,7 @@ class ArduinoConnection(QObject):
         self.connect_button.setText("Connect")
         self.ping_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.set_reset_button_enabled(False)
         self.report_error("CONNECTION", "Socket error occurred", error_text)
         print(f"Socket error: {error_text}")
 
@@ -829,6 +870,7 @@ class ArduinoConnection(QObject):
             "CALIBRATING",
             "CALIBRATION_DONE",
             "MANUAL_THROTTLE_DONE",
+            "RESETTING",
         ):
             self.tcp_rx_buffer = ""
             self.handle_tcp_line(token)
@@ -880,6 +922,12 @@ class ArduinoConnection(QObject):
         elif text == "SEQUENCE_DONE":
             self.stop_sequence_playhead()
             self.set_status("Sequence complete")
+        elif text == "RESETTING":
+            self.stop_sequence_playhead()
+            self.set_armed_indicator(False)
+            self.set_reset_button_enabled(False)
+            self.set_status("Arduino resetting...")
+            print("Arduino resetting...")
         elif text.startswith("ERROR_"):
             self.stop_sequence_playhead()
             self.report_error(
@@ -917,10 +965,6 @@ class ArduinoConnection(QObject):
 
         if self.socket.state() != QAbstractSocket.ConnectedState:
             self.set_status("Not connected")
-            return
-
-        if not self.system_armed:
-            self.report_error("VALIDATION", "Cannot upload sequence", "System is DISARMED - arm the system first")
             return
 
         project_dir = Path(__file__).parent
