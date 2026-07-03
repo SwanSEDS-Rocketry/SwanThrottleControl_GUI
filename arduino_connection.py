@@ -1,4 +1,5 @@
 import csv
+import socket
 import struct
 import subprocess
 import sys
@@ -18,8 +19,24 @@ from PySide6.QtWidgets import (
     QFrame,
     QTextEdit,
     QSlider,
+    QLCDNumber,
 )
 from PySide6.QtNetwork import QTcpSocket, QAbstractSocket
+
+
+TCP_PING_COMMAND = 0xFFFF
+TCP_CALIBRATE_COMMAND = 0xCA1B
+TCP_MANUAL_THROTTLE_COMMAND = 0x4D54  # 'MT'
+
+UDP_TELEMETRY_PORT = 7080
+
+# Voltage scaling.
+# These multiply the Arduino analogue pin voltage.
+# If the Arduino analogue pin receives direct 0-5 V, leave as 1.0.
+# Later, if using resistor dividers, set these to the divider ratios.
+VOLT_5_SCALE = 1.0
+VOLT_24_SCALE = 1.0
+VOLT_48_SCALE = 1.0
 
 
 class ArduinoConnection(QObject):
@@ -62,12 +79,26 @@ class ArduinoConnection(QObject):
 
         self.sequence_graph_frame = window.findChild(QFrame, "sequenceGraphFrame")
 
+        # Optional telemetry display widgets.
+        self.encoder_position_label = window.findChild(QLabel, "encoderPositionLabel")
+
+        # These are QLCDNumber widgets in your GUI.
+        self.volt_5 = window.findChild(QLCDNumber, "volt_5")
+        self.volt_24 = window.findChild(QLCDNumber, "volt_24")
+        self.volt_48 = window.findChild(QLCDNumber, "volt_48")
+
+        self.latest_telemetry = None
+        self.telemetry_print_timer = QElapsedTimer()
+        self.telemetry_print_timer.start()
+
         self.check_widgets_exist()
         self.setup_defaults()
         self.setup_socket()
         self.setup_buttons()
         self.setup_sequence_graph()
         self.setup_manual_throttle_controls()
+        self.setup_voltage_lcds()
+        self.setup_udp_telemetry()
 
     def set_status(self, text):
         self.status_label.setText(text)
@@ -104,6 +135,15 @@ class ArduinoConnection(QObject):
         if self.throttle_set_button is None:
             missing.append("throttleSetButton")
 
+        # These are optional for now so the app does not crash if the names
+        # are slightly different in Qt Designer.
+        if self.volt_5 is None:
+            print("Warning: Could not find QLCDNumber volt_5")
+        if self.volt_24 is None:
+            print("Warning: Could not find QLCDNumber volt_24")
+        if self.volt_48 is None:
+            print("Warning: Could not find QLCDNumber volt_48")
+
         if missing:
             raise RuntimeError(
                 f"Could not find these widgets in main.ui: {', '.join(missing)}"
@@ -131,6 +171,186 @@ class ArduinoConnection(QObject):
         self.select_sequence_button.clicked.connect(self.select_throttle_sequence)
         self.upload_sequence_button.clicked.connect(self.upload_throttle_sequence)
         self.throttle_set_button.clicked.connect(self.set_manual_throttle)
+
+    def setup_voltage_lcds(self):
+        for lcd in (self.volt_5, self.volt_24, self.volt_48):
+            if lcd is not None:
+                lcd.setDigitCount(6)
+                lcd.display(0.0)
+
+    def setup_udp_telemetry(self):
+        try:
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_socket.bind(("0.0.0.0", UDP_TELEMETRY_PORT))
+            self.udp_socket.setblocking(False)
+
+            self.udp_timer = QTimer(self)
+            self.udp_timer.timeout.connect(self.read_udp_telemetry)
+            self.udp_timer.start(50)
+
+            print(f"UDP telemetry listening on port {UDP_TELEMETRY_PORT}")
+
+        except OSError as error:
+            self.udp_socket = None
+            self.udp_timer = None
+            print(f"Failed to start UDP telemetry listener: {error}")
+
+    def read_udp_telemetry(self):
+        if self.udp_socket is None:
+            return
+
+        while True:
+            try:
+                data, addr = self.udp_socket.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except OSError as error:
+                print(f"UDP telemetry read error: {error}")
+                break
+
+            telemetry = self.parse_udp_packet(data)
+
+            if telemetry is None:
+                continue
+
+            self.latest_telemetry = telemetry
+            self.update_telemetry_display(telemetry)
+
+            # Print once per second so the terminal does not get spammed.
+            if self.telemetry_print_timer.elapsed() >= 1000:
+                self.telemetry_print_timer.restart()
+
+                if telemetry["type"] == "telemetry":
+                    print(
+                        "UDP telemetry: "
+                        f"encoder={telemetry['encoder_count']}, "
+                        f"V5={telemetry['volt_5']:.2f}, "
+                        f"V24={telemetry['volt_24']:.2f}, "
+                        f"V48={telemetry['volt_48']:.2f}, "
+                        f"raw=({telemetry['voltage1_raw']}, "
+                        f"{telemetry['voltage2_raw']}, "
+                        f"{telemetry['voltage3_raw']})"
+                    )
+                elif telemetry["type"] == "encoder_sample":
+                    print(
+                        "UDP encoder sample: "
+                        f"encoder={telemetry['encoder_count']}"
+                    )
+
+    def parse_udp_packet(self, data):
+        if len(data) < 1:
+            return None
+
+        packet_type = data[0:1]
+
+        # New 14-byte telemetry packet:
+        # Byte 0      = 'T'
+        # Bytes 1-4   = millis uint32
+        # Bytes 5-6   = encoder int16
+        # Byte 7      = flags
+        # Bytes 8-9   = voltage 1 raw uint16, mapped to volt_5
+        # Bytes 10-11 = voltage 2 raw uint16, mapped to volt_24
+        # Bytes 12-13 = voltage 3 raw uint16, mapped to volt_48
+        if packet_type == b"T":
+            if len(data) == 14:
+                time_ms = struct.unpack_from("<I", data, 1)[0]
+                encoder_count = struct.unpack_from("<h", data, 5)[0]
+
+                flags = data[7]
+                encoder_seen = bool(flags & 0x01)
+                sequence_running = bool(flags & 0x02)
+                calibrating = bool(flags & 0x04)
+
+                voltage1_raw = struct.unpack_from("<H", data, 8)[0]
+                voltage2_raw = struct.unpack_from("<H", data, 10)[0]
+                voltage3_raw = struct.unpack_from("<H", data, 12)[0]
+
+                # Arduino analogue pin voltage, before external scaling.
+                voltage1_pin = voltage1_raw * 5.0 / 1023.0
+                voltage2_pin = voltage2_raw * 5.0 / 1023.0
+                voltage3_pin = voltage3_raw * 5.0 / 1023.0
+
+                # Real displayed voltages after applying scale factors.
+                volt_5_value = voltage1_pin * VOLT_5_SCALE
+                volt_24_value = voltage2_pin * VOLT_24_SCALE
+                volt_48_value = voltage3_pin * VOLT_48_SCALE
+
+                return {
+                    "type": "telemetry",
+                    "time_ms": time_ms,
+                    "encoder_count": encoder_count,
+                    "encoder_seen": encoder_seen,
+                    "sequence_running": sequence_running,
+                    "calibrating": calibrating,
+                    "voltage1_raw": voltage1_raw,
+                    "voltage2_raw": voltage2_raw,
+                    "voltage3_raw": voltage3_raw,
+                    "voltage1_pin": voltage1_pin,
+                    "voltage2_pin": voltage2_pin,
+                    "voltage3_pin": voltage3_pin,
+                    "volt_5": volt_5_value,
+                    "volt_24": volt_24_value,
+                    "volt_48": volt_48_value,
+                }
+
+            # Old 8-byte telemetry packet compatibility.
+            if len(data) == 8:
+                time_ms = struct.unpack_from("<I", data, 1)[0]
+                encoder_count = struct.unpack_from("<h", data, 5)[0]
+                encoder_seen = bool(data[7])
+
+                return {
+                    "type": "telemetry",
+                    "time_ms": time_ms,
+                    "encoder_count": encoder_count,
+                    "encoder_seen": encoder_seen,
+                    "sequence_running": False,
+                    "calibrating": False,
+                    "voltage1_raw": None,
+                    "voltage2_raw": None,
+                    "voltage3_raw": None,
+                    "voltage1_pin": None,
+                    "voltage2_pin": None,
+                    "voltage3_pin": None,
+                    "volt_5": None,
+                    "volt_24": None,
+                    "volt_48": None,
+                }
+
+            return None
+
+        # Encoder sample packet sent during sequences.
+        # Byte 0    = 'E'
+        # Bytes 1-4 = millis uint32
+        # Bytes 5-6 = encoder int16
+        if packet_type == b"E" and len(data) >= 7:
+            time_ms = struct.unpack_from("<I", data, 1)[0]
+            encoder_count = struct.unpack_from("<h", data, 5)[0]
+
+            return {
+                "type": "encoder_sample",
+                "time_ms": time_ms,
+                "encoder_count": encoder_count,
+            }
+
+        return None
+
+    def update_telemetry_display(self, telemetry):
+        if "encoder_count" in telemetry and self.encoder_position_label is not None:
+            self.encoder_position_label.setText(str(telemetry["encoder_count"]))
+
+        if telemetry["type"] != "telemetry":
+            return
+
+        if telemetry["volt_5"] is not None and self.volt_5 is not None:
+            self.volt_5.display(round(telemetry["volt_5"], 2))
+
+        if telemetry["volt_24"] is not None and self.volt_24 is not None:
+            self.volt_24.display(round(telemetry["volt_24"], 2))
+
+        if telemetry["volt_48"] is not None and self.volt_48 is not None:
+            self.volt_48.display(round(telemetry["volt_48"], 2))
 
     def setup_manual_throttle_controls(self):
         self.manual_throttle_slider.setMinimum(0)
@@ -198,8 +418,6 @@ class ArduinoConnection(QObject):
             print("Cannot send manual throttle: not connected")
             return
 
-        TCP_MANUAL_THROTTLE_COMMAND = 0x4D54  # 'MT'
-
         self.socket.write(struct.pack("<H", TCP_MANUAL_THROTTLE_COMMAND))
         self.socket.write(struct.pack("<f", throttle_percent))
         self.socket.flush()
@@ -257,7 +475,6 @@ class ArduinoConnection(QObject):
                         time_ms = float(row[0])
                         throttle = float(row[1])
                     except ValueError:
-                        # Allows header row like: time_ms, throttle
                         continue
 
                     times_ms.append(time_ms)
@@ -374,7 +591,7 @@ class ArduinoConnection(QObject):
             print("Cannot ping: not connected")
             return
 
-        self.socket.write(struct.pack("<H", 0xFFFF))
+        self.socket.write(struct.pack("<H", TCP_PING_COMMAND))
         self.socket.flush()
 
         self.set_status("Ping sent")
@@ -385,7 +602,7 @@ class ArduinoConnection(QObject):
             print("Cannot calibrate: not connected")
             return
 
-        self.socket.write(struct.pack("<H", 0xCA1B))
+        self.socket.write(struct.pack("<H", TCP_CALIBRATE_COMMAND))
         self.socket.flush()
 
         self.set_status("Calibration command sent")
