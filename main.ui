@@ -678,9 +678,9 @@
     <property name="geometry">
      <rect>
       <x>395</x>
-      <y>380</y>
+      <y>395</y>
       <width>80</width>
-      <height>51</height>
+      <height>60</height>
      </rect>
     </property>
     <property name="text">
@@ -688,19 +688,6 @@
     </property>
     <property name="alignment">
      <set>Qt::AlignmentFlag::AlignCenter</set>
-    </property>
-   </widget>
-   <widget class="QPushButton" name="resetArduinoButton">
-    <property name="geometry">
-     <rect>
-      <x>379</x>
-      <y>440</y>
-      <width>111</width>
-      <height>29</height>
-     </rect>
-    </property>
-    <property name="text">
-     <string>Reset Arduino</string>
     </property>
    </widget>
   </widget>

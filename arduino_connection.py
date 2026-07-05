@@ -32,8 +32,8 @@ UDP_TELEMETRY_PORT = 7080
 # These multiply the Arduino analogue pin voltage.
 # If the Arduino analogue pin receives direct 0-5 V, leave as 1.0.
 # Later, if using resistor dividers, set these to the divider ratios.
-VOLT_5_SCALE = 1.0
-VOLT_24_SCALE = 1.0
+VOLT_5_SCALE = 2.525
+VOLT_24_SCALE = 7.221058
 VOLT_48_SCALE = 1.0
 
 # Manual throttle safety limits.
