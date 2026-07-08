@@ -487,25 +487,39 @@ class ArduinoConnection(QObject):
 
         return None
 
+    def deltaH(self, encoder_field):
+        current_h = (
+            -0.000351114 * encoder_field * encoder_field * encoder_field * encoder_field
+            + 0.00101334 * encoder_field * encoder_field * encoder_field
+            - 0.000935964 * encoder_field * encoder_field
+            + 0.00077505 * encoder_field
+        )
+
+        return current_h
+
+
     def update_telemetry_display(self, telemetry):
-        # Use the live UDP arm bit from the Arduino.
-        # In the current Arduino packet, bit5 is START_PIN/ARM_PIN HIGH.
-        # Only True means ARMED. Missing/old packets fail safe to DISARMED.
         if telemetry["type"] == "telemetry":
             self.set_armed_indicator(telemetry.get("armed") is True)
 
         if "encoder_count" in telemetry and self.encoder_position_label is not None:
             self.encoder_position_label.setText(str(telemetry["encoder_count"]))
 
-        # Arduino sends centipercent only after calibration / when the E packet
-        # says isPercent. Display the real percent only when it is known.
-        throttle_percent = telemetry.get("throttle_percent")
+        encoder_raw = telemetry.get("encoder_count")
 
         if self.lcd_throttle_actual is not None:
-            if throttle_percent is not None:
-                self.lcd_throttle_actual.display(round(throttle_percent, 2))
+            if encoder_raw is not None:
+                self.lcd_throttle_actual.display(encoder_raw)
             else:
-                self.lcd_throttle_actual.display(0.0)
+                self.lcd_throttle_actual.display(0)
+
+        if self.lcd_throttle_programmed is not None:
+            if encoder_raw is not None:
+                delta_h_value = self.deltaH(encoder_raw)
+                self.lcd_throttle_programmed.display(round(delta_h_value, 4))
+                print(f"encoder_raw={encoder_raw}, deltaH={delta_h_value}")
+            else:
+                self.lcd_throttle_programmed.display(0.0)
 
         if telemetry["type"] != "telemetry":
             return
@@ -603,9 +617,6 @@ class ArduinoConnection(QObject):
         self.socket.write(struct.pack("<H", TCP_MANUAL_THROTTLE_COMMAND))
         self.socket.write(struct.pack("<f", throttle_percent))
         self.socket.flush()
-
-        if self.lcd_throttle_programmed is not None:
-            self.lcd_throttle_programmed.display(throttle_percent)
 
         self.set_status(f"Manual throttle sent: {throttle_percent:.1f}%")
         print(f"Manual throttle sent: {throttle_percent:.1f}%")
