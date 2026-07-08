@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QFileDialog,
+    QFileDialog,`
     QApplication,
     QVBoxLayout,
     QFrame,
