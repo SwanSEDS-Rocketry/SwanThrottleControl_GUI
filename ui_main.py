@@ -219,7 +219,7 @@ class Ui_MainWindow(object):
         self.calibrateButton.setGeometry(QRect(10, 40, 131, 29))
         self.groupBox_5 = QGroupBox(self.centralwidget)
         self.groupBox_5.setObjectName(u"groupBox_5")
-        self.groupBox_5.setEnabled(False)
+        self.groupBox_5.setEnabled(True)
         self.groupBox_5.setGeometry(QRect(520, 360, 161, 191))
         self.manualThrottleSlider = QSlider(self.groupBox_5)
         self.manualThrottleSlider.setObjectName(u"manualThrottleSlider")
