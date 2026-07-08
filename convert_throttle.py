@@ -29,10 +29,10 @@ def throttle_to_h(throttle: float) -> float:
     Output h is in metres, based on your current equation.
     """
     h = (
-        -0.000351114 * throttle**4
-        + 0.00101334 * throttle**3
-        - 0.000935964 * throttle**2
-        + 0.00077505 * throttle
+        -0.000351114 * -throttle**4
+        + 0.00101334 * -throttle**3
+        - 0.000935964 * -throttle**2
+        + 0.00077505 * -throttle
     )
     return h
 
