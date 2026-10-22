@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QFileDialog,`
+    QFileDialog,
     QApplication,
     QVBoxLayout,
     QFrame,
@@ -74,6 +74,9 @@ class ArduinoConnection(QObject):
         self.sequence_playhead_timer.timeout.connect(self.update_sequence_playhead)
         self.sequence_elapsed_timer = QElapsedTimer()
         self.sequence_playhead_running = False
+        self.sequence_min_throttle_percent = None
+        self.sequence_min_pending_calibrated_telemetry = False
+        self.latest_telemetry = None
 
         self.manual_throttle_slider = window.findChild(QSlider, "manualThrottleSlider")
         self.manual_throttle_text = window.findChild(QTextEdit, "manualThrottleText")
@@ -337,6 +340,7 @@ class ArduinoConnection(QObject):
                 continue
 
             self.latest_telemetry = telemetry
+            self.capture_sequence_minimum_from_telemetry(telemetry)
             self.update_telemetry_display(telemetry)
 
             # Print once per second so the terminal does not get spammed.
@@ -411,7 +415,8 @@ class ArduinoConnection(QObject):
                 volt_24_value = voltage2_pin * VOLT_24_SCALE
                 volt_48_value = voltage3_pin * VOLT_48_SCALE
 
-                throttle_percent = encoder_field / 100.0 if calibrated else None
+                # Arduino now sends encoder position/count in this field, not centipercent.
+                throttle_percent = None
 
                 return {
                     "type": "telemetry",
@@ -486,6 +491,34 @@ class ArduinoConnection(QObject):
             }
 
         return None
+
+    def capture_sequence_minimum_from_telemetry(self, telemetry):
+        if not self.sequence_min_pending_calibrated_telemetry:
+            return
+
+        if not telemetry.get("calibrated") and not telemetry.get("is_percent"):
+            return
+
+        throttle_percent = telemetry.get("throttle_percent")
+        if throttle_percent is None:
+            return
+
+        throttle_percent = max(
+            0.0,
+            min(MANUAL_THROTTLE_MAX_PERCENT, float(throttle_percent)),
+        )
+        self.sequence_min_throttle_percent = throttle_percent
+        self.sequence_min_pending_calibrated_telemetry = False
+
+        message = f"Sequence minimum set from calibrated encoder: {throttle_percent:.2f}%"
+        self.set_status(message)
+        print(message)
+
+    def latch_sequence_minimum_after_calibration(self):
+        self.sequence_min_pending_calibrated_telemetry = True
+
+        if self.latest_telemetry is not None:
+            self.capture_sequence_minimum_from_telemetry(self.latest_telemetry)
 
     def deltaH(self, encoder_field):
         current_h = (
@@ -819,6 +852,9 @@ class ArduinoConnection(QObject):
             )
             return
 
+        self.sequence_min_throttle_percent = None
+        self.sequence_min_pending_calibrated_telemetry = False
+        self.latest_telemetry = None
         self.socket.write(struct.pack("<H", TCP_CALIBRATE_COMMAND))
         self.socket.flush()
         self.set_status("Calibration command sent")
@@ -1026,10 +1062,16 @@ class ArduinoConnection(QObject):
             self.set_status("Sending sequence...")
             result = self.send_converted_sequence_csv(converted_file)
 
-            self.set_status(
+            status = (
                 f"Sequence sent: {result['command_count']} commands, "
                 f"{result['payload_size']} bytes"
             )
+            if result["clamped_count"]:
+                status += (
+                    f", {result['clamped_count']} clamped below "
+                    f"{self.sequence_min_throttle_percent:.2f}%"
+                )
+            self.set_status(status)
 
             # Do not start the playhead here.
             # The latest Arduino waits for START_PIN/ARM_PIN before moving
@@ -1113,6 +1155,15 @@ class ArduinoConnection(QObject):
 
         return payload
 
+    def clamp_sequence_commands_to_calibrated_minimum(self, commands):
+        # The Arduino now remaps user throttle commands itself:
+        #   20% input -> physical low stop
+        #   100% input -> full open
+        #
+        # Do not derive a minimum from telemetry here. The Arduino telemetry
+        # field is encoder count, not calibrated throttle percent.
+        return 0
+
     def send_converted_sequence_csv(self, filename="converted_sequence.csv"):
         if self.socket.state() != QAbstractSocket.ConnectedState:
             self.set_status("Not connected")
@@ -1123,6 +1174,7 @@ class ArduinoConnection(QObject):
         if not commands:
             raise RuntimeError("No valid commands found in converted CSV")
 
+        clamped_count = self.clamp_sequence_commands_to_calibrated_minimum(commands)
         payload = self.build_converted_sequence_payload(commands)
 
         if len(payload) > self.sequence_buffer_capacity:
@@ -1138,8 +1190,14 @@ class ArduinoConnection(QObject):
 
         print(f"Sent {len(commands)} commands")
         print(f"Payload size: {len(payload)} bytes")
+        if clamped_count:
+            print(
+                f"Clamped {clamped_count} sequence command(s) below "
+                f"{self.sequence_min_throttle_percent:.2f}%"
+            )
 
         return {
             "command_count": len(commands),
             "payload_size": len(payload),
+            "clamped_count": clamped_count,
         }
